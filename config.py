@@ -111,3 +111,19 @@ DEBUG_FRAME_SAMPLE_INTERVAL_SECONDS = 1.0
 # Sampling interval for diagnostic edge-comparison dumps — one frame
 # per second gives a representative timeline without flooding the
 # debug folder. Diagnostic use only, not used in production scoring.
+
+# --- Blur/dirty-lens detector --------------------------------------------
+# Detects loss of image sharpness (out-of-focus, smudged/dirty lens) via
+# Variance of Laplacian: the variance of a Laplacian-filtered frame is
+# high when an image has abundant sharp edges, and low when detail has
+# been smoothed away by blur. The standard, well-validated technique
+# for this exact problem in both general CV and device-health-monitoring
+# contexts. Baseline-relative, like the other detectors, since a
+# naturally low-texture scene (e.g. a plain wall) has lower Laplacian
+# variance even when perfectly in focus.
+
+BLUR_SHARPNESS_DROP_RATIO = 0.5
+# Fraction (0-1). A frame is flagged as a blur candidate when its
+# Laplacian variance drops to this fraction (or less) of the camera's
+# baseline sharpness. E.g. 0.5 means "sharpness fell to half or less
+# of normal." Reasoned starting point, not tuned to any specific footage.

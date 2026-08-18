@@ -58,3 +58,56 @@ TEST_RUNS_DIR = DATA_DIR / "test_runs"
 DEBUG_FRAMES_DIR = DATA_DIR / "debug_frames"
 # Saved frames from moments a detector flagged a candidate, for manual
 # visual review during testing. Not used in production runs.
+
+# --- Tampering/obstruction detector ------------------------------------
+# Detects lens obstruction by comparing edge density in grid blocks of
+# the current frame against a camera's baseline, then requiring the
+# largest connected cluster of "structure lost" blocks to exceed a
+# size threshold. Chosen over raw pixel-difference because obstruction
+# is fundamentally a loss of visible structure, not a brightness
+# change. Known limitation: cannot fully separate real obstruction
+# from blur/low-light using this signal alone — see
+# tests/test_tampering_detector.py and the tampering summary doc.
+
+TAMPERING_CANNY_LOW_THRESHOLD = 50
+TAMPERING_CANNY_HIGH_THRESHOLD = 150
+# Standard Canny edge-detector thresholds (low/high hysteresis bounds).
+# Conventional starting values for general-purpose edge detection,
+# not tuned to this specific footage.
+
+TAMPERING_MIN_CONTIGUOUS_BLOCK_FRACTION = 0.15
+# A tampering candidate requires the SINGLE LARGEST connected cluster
+# of "structure lost" blocks to cover at least this fraction of a
+# camera's meaningful baseline structure — not just any blocks adding
+# up to a high total. Real obstruction is physically localized to one
+# region; blur and low-light degrade structure scattered across the
+# whole frame, so they should not form one large contiguous cluster.
+
+TAMPERING_GRID_BLOCK_SIZE = 32
+# Frame is divided into blocks of this size (pixels) for edge-density
+# comparison, rather than comparing individual pixels. Absorbs natural
+# frame-to-frame jitter on fine texture (e.g. blinds, fences) that
+# would otherwise register as false structural change. Generic to any
+# resolution — blocks are computed from actual frame dimensions.
+
+TAMPERING_MIN_BASELINE_BLOCK_EDGE_DENSITY = 0.02
+# A block must have at least this fraction of edge pixels in the
+# baseline to count as meaningful structure. Blocks with little/no
+# baseline structure (e.g. a blank wall) are excluded from scoring,
+# since they have nothing to "disappear."
+
+TAMPERING_BLOCK_DENSITY_DROP_RATIO = 0.5
+# A block is flagged as "disappeared" if its current edge density
+# drops to this fraction (or less) of its baseline density. E.g. 0.5
+# means the block lost at least half its edge structure.
+
+TAMPERING_BASELINE_EDGE_PERSISTENCE_RATIO = 0.5
+# Fraction of baseline-window frames in which a pixel must register as
+# an edge for it to count as stable baseline structure, rather than
+# frame-to-frame noise. Reasoned starting point, not tuned to any
+# specific footage — applies identically to any camera/baseline window.
+
+DEBUG_FRAME_SAMPLE_INTERVAL_SECONDS = 1.0
+# Sampling interval for diagnostic edge-comparison dumps — one frame
+# per second gives a representative timeline without flooding the
+# debug folder. Diagnostic use only, not used in production scoring.

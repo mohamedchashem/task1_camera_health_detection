@@ -1,0 +1,10 @@
+{
+  "video": "data/test_footage/test_video.mp4",
+  "camera_id": "cam1",
+  "faults": [
+    {"type": "tampering", "start_s": 14, "end_s": 18},
+    {"type": "low_light", "start_s": 26, "end_s": 29.9},
+    {"type": "blur", "start_s": 36, "end_s": 39},
+    {"type": "tilt", "start_s": 45, "end_s": 48.9}
+  ]
+}

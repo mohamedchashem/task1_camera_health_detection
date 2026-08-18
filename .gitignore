@@ -4,3 +4,7 @@ __pycache__/
 data/baselines/*
 data/event_frames/*
 data/*.db
+data/test_footage/*
+data/test_runs/*
+data/debug_frames/*
+.pytest_cache/

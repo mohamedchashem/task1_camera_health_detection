@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+data/baselines/*
+data/event_frames/*
+data/*.db

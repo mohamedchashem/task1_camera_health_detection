@@ -127,3 +127,59 @@ BLUR_SHARPNESS_DROP_RATIO = 0.5
 # Laplacian variance drops to this fraction (or less) of the camera's
 # baseline sharpness. E.g. 0.5 means "sharpness fell to half or less
 # of normal." Reasoned starting point, not tuned to any specific footage.
+
+# --- Tilt/angle detector -------------------------------------------------
+# Detects camera rotation via learned local feature matching (DISK,
+# accessed through Kornia) between the current frame and baseline
+# reference. Rotation is measured as the median displacement of
+# matched keypoints, normalized by frame diagonal -- deliberately NOT
+# via homography or affine transform fitting. Model fitting (including
+# using RANSAC purely as an outlier filter) proved numerically unstable
+# on real footage: sparse/clustered matches during faults produce
+# degenerate fits, which silently discarded real tilt matches along
+# with bad ones. Outlier rejection instead uses median absolute
+# deviation (MAD) on the displacement values directly, which requires
+# no geometric model of the scene.
+
+TILT_MAX_KEYPOINTS = 2048
+# Max keypoints to extract per frame, passed to DISK's detector.
+
+TILT_MIN_RELIABLE_MATCHES = 10
+# Minimum matched keypoint pairs required to trust a rotation estimate.
+# Below this, the frame is skipped rather than risk a meaningless
+# angle from too few points. Applied both to raw matches and to
+# MAD-filtered inlier matches.
+
+TILT_MEDIAN_SHIFT_THRESHOLD_RATIO = 0.1
+# A frame is flagged as a tilt candidate when the median displacement
+# of matched keypoints reaches this fraction of the frame's diagonal
+# length or more (e.g. 0.1 = median keypoint shift of 10% of the
+# diagonal). Scale-independent, so it applies the same way regardless
+# of camera resolution. Reasoned starting point, not tuned to this
+# footage.
+
+TILT_SHIFT_CONFIDENCE_CEILING_RATIO = 0.3
+# Median-shift ratio at which confidence saturates to 1.0.
+
+TILT_MAD_REJECTION_THRESHOLD = 3.0
+# Number of MADs (median absolute deviations) a matched point's
+# displacement may differ from the median before it's rejected as an
+# outlier. 3.0 follows the "X84 rule," a standard robust-statistics
+# default (~2 standard deviations under Gaussian noise), also reported
+# as effective for outlier rejection in feature-tracking specifically.
+
+TILT_MAD_EPSILON = 1e-6
+# Floor value for MAD when computing outlier z-scores. Guards against
+# division by a near-zero MAD, which happens when matched-point
+# displacements are already nearly identical (e.g. a static scene) --
+# that case has nothing to reject, not everything to reject.
+
+TILT_MATCH_RATIO_THRESHOLD = 1.0
+# Threshold for match_smnn's nearest-neighbor ratio test. Loosened from
+# an initial 0.9 after diagnosing that large real perspective changes
+# make correct keypoint matches look less similar (higher ratio) than
+# under mild viewpoint changes -- a real, generalizable property of
+# matching under significant camera movement, not specific to one
+# video. RANSAC (downstream) filters remaining false matches, so this
+# threshold's job is only to avoid discarding genuine matches too
+# aggressively before RANSAC gets a chance to see them.

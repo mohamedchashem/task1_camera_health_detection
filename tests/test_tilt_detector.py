@@ -12,14 +12,21 @@ import json
 import cv2
 import pytest
 
-from config import BASELINES_DIR, PROJECT_ROOT
-from detectors.tilt import evaluate, extract_features
+from config import (
+    BASELINES_DIR,
+    PROJECT_ROOT,
+    TEST_MAX_UNRELATED_FALSE_POSITIVE_RATE as MAX_UNRELATED_FALSE_POSITIVE_RATE,
+    TEST_MIN_TRUE_POSITIVE_CANDIDATE_RATE as MIN_TRUE_POSITIVE_CANDIDATE_RATE,
+)
+from detectors.tilt import configure, evaluate, extract_features
 from pipeline.file_reader import read_frames_from_file
 
-FIXTURE_PATH = PROJECT_ROOT / "tests" / "fixtures" / "test_video_ground_truth.json"
+# GPU mandate: all DISK model inference in this test suite must explicitly
+# target cuda:0. configure() records the device; the DISK model itself is
+# still loaded lazily on the first extract_features() call in the fixtures.
+configure(device="cuda")
 
-MIN_TRUE_POSITIVE_CANDIDATE_RATE = 0.7
-MAX_UNRELATED_FALSE_POSITIVE_RATE = 0.05
+FIXTURE_PATH = PROJECT_ROOT / "tests" / "fixtures" / "test_video_ground_truth.json"
 
 # Median-keypoint-displacement tilt detection cannot yet cleanly
 # separate real camera rotation from other faults that also displace
@@ -49,7 +56,8 @@ def baseline_features(fixture_data: dict) -> tuple:
     frame = cv2.imread(str(image_path))
     if frame is None:
         pytest.skip(f"Failed to load baseline at {image_path}.")
-    return extract_features(frame)
+    keypoints, descriptors = extract_features(frame)
+    return keypoints, descriptors, frame.shape[:2]
 
 
 @pytest.fixture(scope="module")
@@ -58,10 +66,10 @@ def scored_frames(fixture_data: dict, baseline_features: tuple) -> list[dict]:
     if not video_path.exists():
         pytest.skip(f"Test video not found at {video_path}.")
 
-    baseline_keypoints, baseline_descriptors = baseline_features
+    baseline_keypoints, baseline_descriptors, baseline_shape = baseline_features
     results = []
     for frame_number, video_time_s, frame in read_frames_from_file(video_path):
-        result = evaluate(frame, baseline_keypoints, baseline_descriptors)
+        result = evaluate(frame, baseline_keypoints, baseline_descriptors, baseline_shape)
         results.append(
             {
                 "frame_number": frame_number,

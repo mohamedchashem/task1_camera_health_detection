@@ -18,7 +18,7 @@ import logging
 import sys
 from pathlib import Path
 
-from config import BASELINES_DIR, TEST_RUNS_DIR
+from config import BASELINES_DIR, TEST_RUNS_DIR, validate_config
 from detectors.blur import evaluate
 from pipeline.file_reader import read_frames_from_file
 from pipeline.paths import validate_camera_id
@@ -67,6 +67,7 @@ def validate_against_file(camera_id: str, video_path: Path) -> Path:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    validate_config()
 
     if len(sys.argv) != 3:
         logger.error("Usage: python -m scripts.validate_blur_ground_truth <camera_id> <video_path>")

@@ -13,7 +13,12 @@ from pathlib import Path
 
 import pytest
 
-from config import BASELINES_DIR, PROJECT_ROOT
+from config import (
+    BASELINES_DIR,
+    PROJECT_ROOT,
+    TEST_MAX_UNRELATED_FALSE_POSITIVE_RATE as MAX_UNRELATED_FALSE_POSITIVE_RATE,
+    TEST_MIN_TRUE_POSITIVE_CANDIDATE_RATE as MIN_TRUE_POSITIVE_CANDIDATE_RATE,
+)
 from detectors.brightness import evaluate
 from pipeline.file_reader import read_frames_from_file
 
@@ -24,8 +29,6 @@ FIXTURE_PATH = PROJECT_ROOT / "tests" / "fixtures" / "test_video_ground_truth.js
 # accepted overlap the plan defers to the decision layer. Only faults
 # unrelated to brightness (blur, tilt) are held to a strict silence
 # requirement here.
-MIN_TRUE_POSITIVE_CANDIDATE_RATE = 0.7
-MAX_UNRELATED_FALSE_POSITIVE_RATE = 0.05
 BRIGHTNESS_ADJACENT_FAULT_TYPES = {"tampering"}
 
 

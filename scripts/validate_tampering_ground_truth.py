@@ -13,15 +13,18 @@ Usage:
 from __future__ import annotations
 
 import csv
+import logging
 import sys
 from pathlib import Path
 
 import cv2
 
-from config import BASELINES_DIR, TEST_RUNS_DIR
+from config import BASELINES_DIR, TEST_RUNS_DIR, validate_config
 from detectors.tampering import evaluate
 from pipeline.file_reader import read_frames_from_file
 from pipeline.paths import validate_camera_id
+
+logger = logging.getLogger(__name__)
 
 
 def _load_baseline_edges(camera_id: str):
@@ -63,13 +66,16 @@ def validate_against_file(camera_id: str, video_path: Path) -> Path:
                 ]
             )
 
-    print(f"Wrote {frame_number} scored frames to {output_csv}")
+    logger.info("Wrote %d scored frames to %s", frame_number, output_csv)
     return output_csv
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    validate_config()
+
     if len(sys.argv) != 3:
-        print("Usage: python -m scripts.validate_tampering_ground_truth <camera_id> <video_path>")
+        logger.error("Usage: python -m scripts.validate_tampering_ground_truth <camera_id> <video_path>")
         sys.exit(1)
 
     validate_against_file(sys.argv[1], Path(sys.argv[2]))

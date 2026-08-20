@@ -13,14 +13,16 @@ import json
 import cv2
 import pytest
 
-from config import BASELINES_DIR, PROJECT_ROOT
+from config import (
+    BASELINES_DIR,
+    PROJECT_ROOT,
+    TAMPERING_TEST_MIN_TRUE_POSITIVE_CANDIDATE_RATE as MIN_TRUE_POSITIVE_CANDIDATE_RATE,
+    TEST_MAX_UNRELATED_FALSE_POSITIVE_RATE as MAX_UNRELATED_FALSE_POSITIVE_RATE,
+)
 from detectors.tampering import evaluate
 from pipeline.file_reader import read_frames_from_file
 
 FIXTURE_PATH = PROJECT_ROOT / "tests" / "fixtures" / "test_video_ground_truth.json"
-
-MIN_TRUE_POSITIVE_CANDIDATE_RATE = 0.6
-MAX_UNRELATED_FALSE_POSITIVE_RATE = 0.05
 
 # Edge-density tampering detection cannot yet cleanly separate real
 # obstruction from other faults that also disrupt frame structure:

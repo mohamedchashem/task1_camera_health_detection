@@ -1,10 +1,37 @@
+# Virtual environments
 venv/
+.venv/
+env/
+
+# Python bytecode & caches
 __pycache__/
-*.pyc
-data/baselines/*
-data/event_frames/*
-data/*.db
+*.py[cod]
+.pytest_cache/
+
+# Runtime & test data outputs
 data/test_footage/*
+data/baselines/*
+data/logs/*
+data/event_frames/*
+data/events.db
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db-journal
 data/test_runs/*
 data/debug_frames/*
-.pytest_cache/
+
+# Build & tooling noise
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

@@ -9,15 +9,12 @@ low-texture scene has lower Laplacian variance even in perfect focus.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
 from config import BLUR_SHARPNESS_DROP_RATIO
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -42,11 +39,14 @@ def evaluate(frame: np.ndarray, baseline_sharpness: float) -> BlurResult:
 
     is_candidate = sharpness_ratio <= BLUR_SHARPNESS_DROP_RATIO
 
-    # Min-max scaled: 1.0 confidence at baseline-drop-ratio or below,
-    # 0.0 confidence at full baseline sharpness or above — matches the
-    # same normalization principle used by the low-light detector.
-    scale_range = max(1.0 - BLUR_SHARPNESS_DROP_RATIO, 1e-6)
-    confidence = float(np.clip((1.0 - sharpness_ratio) / scale_range, 0.0, 1.0))
+    # Severity-scaled confidence: 0.0 at full baseline sharpness (no blur),
+    # 1.0 at zero sharpness (total blur). The previous min-max mapping
+    # saturated at 1.0 exactly at the candidate threshold (50% of baseline
+    # sharpness), so even a mild blur at the edge of detection read as a
+    # full-strength fault. This linear map keeps the same endpoints as the
+    # low-light detector's normalization (0 at baseline, 1 at the extreme)
+    # and leaves candidate gating to BLUR_SHARPNESS_DROP_RATIO alone.
+    confidence = float(np.clip(1.0 - sharpness_ratio, 0.0, 1.0))
 
     return BlurResult(
         sharpness=sharpness,

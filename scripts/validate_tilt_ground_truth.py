@@ -19,7 +19,7 @@ from pathlib import Path
 
 import cv2
 
-from config import BASELINES_DIR, TEST_RUNS_DIR
+from config import BASELINES_DIR, TEST_RUNS_DIR, validate_config
 from detectors.tilt import evaluate, extract_features
 from pipeline.file_reader import read_frames_from_file
 from pipeline.paths import validate_camera_id
@@ -58,7 +58,7 @@ def validate_against_file(camera_id: str, video_path: Path) -> Path:
         )
 
         for frame_number, video_time_s, frame in read_frames_from_file(video_path):
-            result = evaluate(frame, baseline_keypoints, baseline_descriptors)
+            result = evaluate(frame, baseline_keypoints, baseline_descriptors, baseline_frame.shape[:2])
             writer.writerow(
                 [
                     frame_number,
@@ -79,6 +79,7 @@ def validate_against_file(camera_id: str, video_path: Path) -> Path:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    validate_config()
 
     if len(sys.argv) != 3:
         logger.error("Usage: python -m scripts.validate_tilt_ground_truth <camera_id> <video_path>")

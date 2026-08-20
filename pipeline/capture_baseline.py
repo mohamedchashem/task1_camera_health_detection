@@ -23,6 +23,7 @@ from config import (
     BASELINE_CAPTURE_SECONDS,
     BASELINES_DIR,
     TAMPERING_BASELINE_EDGE_PERSISTENCE_RATIO,
+    validate_config,
 )
 from detectors.blur import compute_sharpness
 from detectors.brightness import compute_dark_pixel_ratio
@@ -111,6 +112,7 @@ if __name__ == "__main__":
     import sys
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    validate_config()
 
     if len(sys.argv) != 3:
         logger.error("Usage: python -m pipeline.capture_baseline <camera_id> <source>")

@@ -11,14 +11,16 @@ import json
 
 import pytest
 
-from config import BASELINES_DIR, PROJECT_ROOT
+from config import (
+    BASELINES_DIR,
+    PROJECT_ROOT,
+    TEST_MAX_UNRELATED_FALSE_POSITIVE_RATE as MAX_UNRELATED_FALSE_POSITIVE_RATE,
+    TEST_MIN_TRUE_POSITIVE_CANDIDATE_RATE as MIN_TRUE_POSITIVE_CANDIDATE_RATE,
+)
 from detectors.blur import evaluate
 from pipeline.file_reader import read_frames_from_file
 
 FIXTURE_PATH = PROJECT_ROOT / "tests" / "fixtures" / "test_video_ground_truth.json"
-
-MIN_TRUE_POSITIVE_CANDIDATE_RATE = 0.7
-MAX_UNRELATED_FALSE_POSITIVE_RATE = 0.05
 
 # Laplacian-variance blur detection cannot yet cleanly separate real
 # out-of-focus/dirty-lens blur from other faults that also reduce

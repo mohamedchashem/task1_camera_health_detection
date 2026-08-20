@@ -15,8 +15,14 @@ from detectors.tampering import (
     _compute_block_density,
     compute_largest_contiguous_loss_fraction,
     compute_loss_fractions,
+    confidence_from_largest_fraction,
+    meaningful_block_fraction,
 )
-from detectors.tilt import _mad_inlier_mask
+from detectors.tilt import (
+    _mad_inlier_mask,
+    inlier_ratio_sufficient,
+    match_volume_sufficient,
+)
 from pipeline.paths import validate_camera_id
 
 
@@ -40,6 +46,89 @@ def test_mad_inlier_mask_rejects_far_outlier() -> None:
 def test_mad_inlier_mask_keeps_tight_cluster() -> None:
     displacements = np.array([1.0, 1.1, 1.2, 0.9, 1.15])
     assert _mad_inlier_mask(displacements).all()
+
+
+# --- detectors.tilt.match_volume_sufficient ---------------------------------
+
+
+def test_match_volume_sufficient_requires_absolute_floor() -> None:
+    assert not match_volume_sufficient(5, 500, 500)  # below TILT_MIN_RELIABLE_MATCHES
+
+
+def test_match_volume_sufficient_requires_relative_ratio() -> None:
+    # 20 matches from 2000/2000 keypoints is 1% -- far below the guard: a
+    # handful of spurious correspondences must not be trusted.
+    assert not match_volume_sufficient(20, 2000, 2000)
+
+
+def test_match_volume_sufficient_passes_on_healthy_volume() -> None:
+    assert match_volume_sufficient(500, 2000, 1800)
+
+
+def test_match_volume_sufficient_rejects_degenerate_frames() -> None:
+    # A frame with zero keypoints has nothing to match against.
+    assert not match_volume_sufficient(0, 2000, 0)
+    assert not match_volume_sufficient(10, 2000, 0)
+
+
+# --- detectors.tilt.inlier_ratio_sufficient ---------------------------------
+
+
+def test_inlier_ratio_sufficient_passes_healthy_fraction() -> None:
+    assert inlier_ratio_sufficient(480, 500)
+
+
+def test_inlier_ratio_sufficient_rejects_scattered_matches() -> None:
+    # Blur/obscuration garbage is scattered: MAD rejects most matches.
+    assert not inlier_ratio_sufficient(5, 50)
+
+
+def test_inlier_ratio_sufficient_rejects_empty_matches() -> None:
+    assert not inlier_ratio_sufficient(0, 0)
+
+
+# --- detectors.tampering.meaningful_block_fraction --------------------------
+
+
+def test_meaningful_block_fraction_full_structure_is_one() -> None:
+    edges = np.full((64, 64), 255, dtype=np.uint8)
+    assert meaningful_block_fraction(edges) == pytest.approx(1.0)
+
+
+def test_meaningful_block_fraction_empty_structure_is_zero() -> None:
+    edges = np.zeros((64, 64), dtype=np.uint8)
+    assert meaningful_block_fraction(edges) == pytest.approx(0.0)
+
+
+def test_meaningful_block_fraction_sparse_structure() -> None:
+    # One of four 32x32 blocks full of edges -> 0.25, below the 0.5 guard:
+    # a sparse-structure baseline must be treated as degraded.
+    edges = np.zeros((64, 64), dtype=np.uint8)
+    edges[0:32, 0:32] = 255
+    assert meaningful_block_fraction(edges) == pytest.approx(0.25)
+
+
+# --- detectors.tampering.confidence_from_largest_fraction -------------------
+
+
+def test_tampering_confidence_maps_threshold_to_zero() -> None:
+    # At the smallest reportable obstruction the normalized confidence is 0.
+    assert confidence_from_largest_fraction(0.15) == pytest.approx(0.0)
+
+
+def test_tampering_confidence_maps_half_blocked_to_half() -> None:
+    # 0.575 of the baseline structure lost in one cluster -> confidence 0.5,
+    # which is the emission floor for tampering.
+    assert confidence_from_largest_fraction(0.575) == pytest.approx(0.5, abs=1e-9)
+
+
+def test_tampering_confidence_full_block_is_one() -> None:
+    assert confidence_from_largest_fraction(1.0) == pytest.approx(1.0)
+
+
+def test_tampering_confidence_clamps_below_threshold() -> None:
+    assert confidence_from_largest_fraction(0.0) == pytest.approx(0.0)
+    assert confidence_from_largest_fraction(0.1) == pytest.approx(0.0)
 
 
 # --- detectors.tampering._compute_block_density ----------------------------

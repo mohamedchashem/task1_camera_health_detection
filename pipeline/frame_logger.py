@@ -162,6 +162,7 @@ class FrameLogger:
                     "status": obs.status,
                     "is_candidate": obs.is_candidate,
                     "confidence": round(obs.confidence, 6),
+                    "reason": obs.reason,
                     "error_message": obs.error_message,
                 }
                 for obs in frame.detectors

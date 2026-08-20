@@ -16,7 +16,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from config import DECISION_SUPPRESSOR_MIN_CONFIDENCE
+from config import (
+    DECISION_GATE_CONFIDENCE,
+    DECISION_GATE_CONFIDENCE_BY_GATE,
+    DECISION_SUPPRESSOR_MIN_CONFIDENCE,
+)
 from pipeline.decision_engine import (
     DETECTOR_STATUS_ERROR,
     DETECTOR_STATUS_OK,
@@ -98,8 +102,10 @@ def test_no_candidates_fuses_to_no_primary() -> None:
 
 
 def test_tampering_suppresses_low_light_blur_tilt() -> None:
+    # tampering at 0.6 is an active suppressor (>= GATE) and clears the
+    # relative margin against every symptom (0.6 * MARGIN = 0.9).
     obs = (
-        _obs("tampering", is_candidate=True, confidence=0.4),
+        _obs("tampering", is_candidate=True, confidence=0.6),
         _obs("low_light", is_candidate=True, confidence=0.9),
         _obs("blur", is_candidate=True, confidence=0.8),
         _obs("tilt", is_candidate=True, confidence=0.5),
@@ -108,7 +114,7 @@ def test_tampering_suppresses_low_light_blur_tilt() -> None:
     assert primary == "tampering"
     assert secondary == ()
     assert suppressed == ("low_light", "tilt", "blur")
-    assert confidence == pytest.approx(0.4)
+    assert confidence == pytest.approx(0.6)
 
 
 def test_low_light_suppresses_blur_and_tilt() -> None:
@@ -146,30 +152,32 @@ def test_low_light_suppresses_other_fault(other: str) -> None:
 def test_precedence_beats_confidence() -> None:
     # Tilt now outranks blur: a detected tilt causally explains blur's
     # apparent sharpness loss, so tilt wins even when blur's confidence is
-    # higher (precedence beats confidence).
+    # higher (precedence beats confidence) -- as long as the suppressor
+    # clears the relative margin (0.6 * MARGIN = 0.9 >= 0.9).
     obs = (
-        _obs("tilt", is_candidate=True, confidence=0.5),
+        _obs("tilt", is_candidate=True, confidence=0.6),
         _obs("blur", is_candidate=True, confidence=0.9),
     )
     primary, secondary, suppressed, confidence = fuse_observations(obs)
     assert primary == "tilt"
     assert secondary == ()
     assert suppressed == ("blur",)
-    assert confidence == pytest.approx(0.5)
+    assert confidence == pytest.approx(0.6)
 
 
 def test_tilt_suppresses_blur_when_both_fire() -> None:
     # Rotation resampling lowers Laplacian sharpness, so a real tilt event
     # also trips the blur detector; the causal cause must win the primary.
+    # tilt 0.7 clears the margin against blur 1.0 (0.7 * MARGIN = 1.05).
     obs = (
         _obs("blur", is_candidate=True, confidence=1.0),
-        _obs("tilt", is_candidate=True, confidence=0.32),
+        _obs("tilt", is_candidate=True, confidence=0.7),
     )
     primary, secondary, suppressed, confidence = fuse_observations(obs)
     assert primary == "tilt"
     assert secondary == ()
     assert suppressed == ("blur",)
-    assert confidence == pytest.approx(0.32)
+    assert confidence == pytest.approx(0.7)
 
 
 def test_weak_candidate_alone_still_becomes_primary() -> None:
@@ -195,13 +203,15 @@ def test_error_detector_never_contributes_candidate() -> None:
 
 
 def test_split_candidates_for_primary_partitions_around_fixed_primary() -> None:
-    # Three detectors firing on the same frame, in precedence order.
-    candidates = ("tampering", "blur", "tilt")
+    # Three detectors firing on the same frame. The input arrives in
+    # detector execution order (DECISION_EXECUTION_ORDER), which is NOT the
+    # fusion precedence order -- output must still be precedence-ordered.
+    candidates = ("blur", "tampering", "tilt")
 
     # tampering causally explains blur + tilt (per DECISION_SUPPRESSION_MAP).
     secondary, suppressed = split_candidates_for_primary("tampering", candidates)
     assert secondary == ()
-    assert suppressed == ("blur", "tilt")
+    assert suppressed == ("tilt", "blur")
 
     # blur and tilt explain nothing: all others become secondary symptoms.
     secondary, suppressed = split_candidates_for_primary("blur", candidates)
@@ -217,7 +227,7 @@ def test_split_candidates_for_primary_partitions_around_fixed_primary() -> None:
     # its own suppression map to the remaining candidates.
     secondary, suppressed = split_candidates_for_primary("low_light", candidates)
     assert secondary == ("tampering",)
-    assert suppressed == ("blur", "tilt")
+    assert suppressed == ("tilt", "blur")
 
 # --- 2. Confidence gating --------------------------------------------------
 
@@ -248,15 +258,221 @@ def test_weak_tampering_does_not_suppress_strong_low_light() -> None:
 
 
 def test_suppressor_at_exact_gate_is_active() -> None:
-    # The gate is inclusive: confidence == GATE counts as an active suppressor.
+    # The gate is inclusive: confidence == GATE counts as an active
+    # suppressor, and it clears the margin against a 0.75 candidate
+    # (GATE * DECISION_SUPPRESSION_MARGIN = 0.75).
     obs = (
         _obs("low_light", is_candidate=True, confidence=GATE),
-        _obs("blur", is_candidate=True, confidence=0.9),
+        _obs("blur", is_candidate=True, confidence=0.75),
     )
     primary, secondary, suppressed, _ = fuse_observations(obs)
     assert primary == "low_light"
     assert secondary == ()
     assert suppressed == ("blur",)
+
+
+def test_margin_rule_blocks_gate_passing_suppressor_over_strong_candidate() -> None:
+    # The relative-margin rule: tampering at 0.6 passes the confidence gate
+    # but its effective strength (0.6 * DECISION_SUPPRESSION_MARGIN = 0.9) is
+    # below the 1.0 tilt signal, so it must NOT hijack the stronger
+    # lower-precedence candidate. This is the mechanism that stops weak
+    # tampering noise from overriding a strong tilt.
+    obs = (
+        _obs("tampering", is_candidate=True, confidence=0.6),
+        _obs("tilt", is_candidate=True, confidence=1.0),
+    )
+    primary, secondary, suppressed, _ = fuse_observations(obs)
+    assert primary == "tilt"
+    assert secondary == ("tampering",)
+    assert suppressed == ()
+
+
+def test_margin_rule_keeps_strong_suppressor() -> None:
+    # tampering at 0.7 clears the margin against tilt 1.0 (0.7 * MARGIN
+    # = 1.05): a genuinely strong cause still wins the primary label.
+    obs = (
+        _obs("tampering", is_candidate=True, confidence=0.7),
+        _obs("tilt", is_candidate=True, confidence=1.0),
+    )
+    primary, secondary, suppressed, _ = fuse_observations(obs)
+    assert primary == "tampering"
+    assert secondary == ()
+    assert suppressed == ("tilt",)
+
+
+# --- Execution gating (gate-skip) -------------------------------------------
+
+
+def test_high_confidence_low_light_gate_skips_tampering_and_tilt() -> None:
+    calls = {"tampering": 0, "tilt": 0}
+
+    def counting_detector(name: str):
+        def detect(frame: np.ndarray) -> object:
+            calls[name] += 1
+            return _Result(is_candidate=False)
+        return detect
+
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "low_light": _Detector(
+                result=_Result(is_candidate=True, confidence=DECISION_GATE_CONFIDENCE + 0.1)
+            ),
+            "blur": _Detector(result=_Result(is_candidate=True, confidence=0.9)),
+            "tampering": counting_detector("tampering"),
+            "tilt": counting_detector("tilt"),
+        },
+    )
+    decision = engine.process_frame(_frame(), 0, 0.0)
+    by_name = {obs.detector: obs for obs in decision.detectors}
+
+    assert by_name["tampering"].status == DETECTOR_STATUS_SKIPPED
+    assert by_name["tampering"].reason == "suppressed_by_gate"
+    assert by_name["tilt"].status == DETECTOR_STATUS_SKIPPED
+    assert by_name["tilt"].reason == "suppressed_by_gate"
+    # blur is the primary optical signal during low-light transitions and
+    # must stay active.
+    assert by_name["blur"].status == DETECTOR_STATUS_OK
+    # The expensive structural detectors never ran: no wasted DISK work.
+    assert calls["tampering"] == 0
+    assert calls["tilt"] == 0
+
+
+def test_low_light_below_gate_keeps_structural_detectors_active() -> None:
+    calls = {"tampering": 0, "tilt": 0}
+
+    def counting_detector(name: str):
+        def detect(frame: np.ndarray) -> object:
+            calls[name] += 1
+            return _Result(is_candidate=False)
+        return detect
+
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "low_light": _Detector(
+                result=_Result(is_candidate=True, confidence=DECISION_GATE_CONFIDENCE - 0.1)
+            ),
+            "tampering": counting_detector("tampering"),
+            "tilt": counting_detector("tilt"),
+        },
+    )
+    engine.process_frame(_frame(), 0, 0.0)
+    # Mild dimming is not near-black: structural detectors still run so a
+    # real tilt during measurable light is not missed.
+    assert calls["tampering"] == 1
+    assert calls["tilt"] == 1
+
+
+def test_high_confidence_blur_gate_skips_tilt() -> None:
+    # Regression: severe blur (test_video2, cam_02) made DISK emit a handful
+    # of spurious correspondences whose median displacement read as a huge
+    # false tilt (confidence 1.0 at blur ~0.99), which even got temporally
+    # confirmed during the blur window. A blur gate at >= 0.90 must skip the
+    # unmeasurable tilt detector so its confirmation window ages out.
+    calls = {"tilt": 0}
+
+    def counting_tilt(frame: np.ndarray) -> object:
+        calls["tilt"] += 1
+        return _Result(is_candidate=False)
+
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "blur": _Detector(result=_Result(is_candidate=True, confidence=0.95)),
+            "tilt": counting_tilt,
+        },
+    )
+    decision = engine.process_frame(_frame(), 0, 0.0)
+    by_name = {obs.detector: obs for obs in decision.detectors}
+
+    assert by_name["tilt"].status == DETECTOR_STATUS_SKIPPED
+    assert by_name["tilt"].reason == "suppressed_by_gate"
+    # The expensive structural detector never ran: no wasted DISK work.
+    assert calls["tilt"] == 0
+
+
+def test_blur_below_gate_keeps_tilt_active() -> None:
+    # Moderate blur is still measurable for keypoint matching: a real tilt
+    # during it must not be missed.
+    calls = {"tilt": 0}
+
+    def counting_tilt(frame: np.ndarray) -> object:
+        calls["tilt"] += 1
+        return _Result(is_candidate=False)
+
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "blur": _Detector(
+                result=_Result(
+                    is_candidate=True,
+                    confidence=DECISION_GATE_CONFIDENCE_BY_GATE["blur"] - 0.1,
+                )
+            ),
+            "tilt": counting_tilt,
+        },
+    )
+    engine.process_frame(_frame(), 0, 0.0)
+    assert calls["tilt"] == 1
+
+
+# --- Emission gating (confirmation confidence floor) ------------------------
+
+
+def test_confirmation_requires_emission_confidence_floor() -> None:
+    tracker = _make_tracker()
+    # Candidates below the per-fault floor (0.5) never count as positives:
+    # three consecutive weak candidates must NOT confirm an event.
+    for frame_number, t in [(0, 0.0), (1, 1.0), (2, 2.0)]:
+        events = tracker.update({"low_light": 0.2}, ["low_light"], frame_number, t)
+        assert events == []
+    assert tracker.confirmation_status()["low_light"] == TEMPORAL_STATUS_PENDING
+
+    # The same detector above the floor confirms normally.
+    for frame_number, t in [(3, 3.0), (4, 4.0), (5, 5.0)]:
+        tracker.update({"low_light": 0.7}, ["low_light"], frame_number, t)
+    assert tracker.confirmation_status()["low_light"] == TEMPORAL_STATUS_CONFIRMED
+
+
+def test_engine_emission_floor_prevents_weak_candidate_event() -> None:
+    # Regression for the low-confidence tampering false positive (t=47.49s of
+    # test_video2): a persistent 0.2-confidence candidate must never log.
+    engine = DecisionEngine(
+        "cam1",
+        {"tampering": _Detector(result=_Result(is_candidate=True, confidence=0.2))},
+    )
+    for frame_number, t in [(0, 0.0), (1, 1.0), (2, 2.0)]:
+        engine.process_frame(_frame(), frame_number, t)
+    assert engine.drain_events() == []
+
+
+def test_engine_emission_floor_still_confirms_strong_candidate() -> None:
+    engine = DecisionEngine(
+        "cam1",
+        {"tampering": _Detector(result=_Result(is_candidate=True, confidence=0.7))},
+    )
+    for frame_number, t in [(0, 0.0), (1, 1.0), (2, 2.0)]:
+        engine.process_frame(_frame(), frame_number, t)
+    events = engine.drain_events()
+    assert len(events) == 1
+    assert events[0].fault_type == "tampering"
+    assert events[0].status == EVENT_STATUS_CONFIRMED
+    assert events[0].peak_confidence == pytest.approx(0.7)
+
+
+def test_tilt_reason_surfaces_in_observation() -> None:
+    class _TiltResult:
+        is_candidate = False
+        confidence = 0.0
+        reason = "insufficient_matches"
+
+    engine = DecisionEngine("cam1", {"tilt": _Detector(result=_TiltResult())})
+    decision = engine.process_frame(_frame(), 0, 0.0)
+    obs = decision.detectors[0]
+    assert obs.status == DETECTOR_STATUS_OK
+    assert obs.is_candidate is False
+    assert obs.reason == "insufficient_matches"
 
 
 # --- 3. Temporal confirmation ----------------------------------------------

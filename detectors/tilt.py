@@ -34,6 +34,8 @@ import torch
 from config import (
     TILT_MAX_KEYPOINTS,
     TILT_MIN_RELIABLE_MATCHES,
+    TILT_MIN_MATCH_RATIO,
+    TILT_MIN_INLIER_RATIO,
     TILT_MEDIAN_SHIFT_THRESHOLD_RATIO,
     TILT_MAD_REJECTION_THRESHOLD,
     TILT_MAD_EPSILON,
@@ -44,6 +46,11 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Tilt estimate statuses (see TiltResult.reason).
+TILT_STATUS_OK = "ok"
+TILT_STATUS_INSUFFICIENT_MATCHES = "insufficient_matches"
+TILT_STATUS_NO_FEATURES = "no_features"
 
 # The DISK model is deliberately NOT initialized at import time: importing
 # this module must not download weights or construct the model. Loading
@@ -61,6 +68,45 @@ class TiltResult:
     confidence: float
     is_candidate: bool
     reliable: bool
+    reason: str | None = None  # TILT_STATUS_*; None for pre-guard code paths
+    match_count: int = 0       # correspondences surviving mutual-NN matching
+
+
+def match_volume_sufficient(
+    match_count: int,
+    baseline_keypoint_count: int,
+    current_keypoint_count: int,
+) -> bool:
+    """Guard that a rotation estimate has enough correspondence volume.
+
+    Requires an absolute floor of matched pairs AND that the matches
+    represent a meaningful fraction of the SMALLER of the two frames'
+    keypoint sets. On severely blurred/obscured/near-black frames DISK can
+    still emit a handful of spurious correspondences that pass the absolute
+    floor; their median displacement is meaningless but would otherwise read
+    as a huge false tilt. Pure function (no tensors) so it is unit-testable.
+    """
+    if match_count < TILT_MIN_RELIABLE_MATCHES:
+        return False
+    denominator = min(baseline_keypoint_count, current_keypoint_count)
+    if denominator <= 0:
+        return False
+    return (match_count / denominator) >= TILT_MIN_MATCH_RATIO
+
+
+def inlier_ratio_sufficient(inlier_count: int, match_count: int) -> bool:
+    """Guard that most matches agree after MAD outlier rejection.
+
+    A genuine camera displacement moves features coherently, so most matches
+    are inliers; blur/obscuration garbage is scattered and MAD rejects most
+    of it. Pure function (no tensors) so it is unit-testable.
+    """
+    if match_count <= 0:
+        return False
+    return (
+        inlier_count >= TILT_MIN_RELIABLE_MATCHES
+        and (inlier_count / match_count) >= TILT_MIN_INLIER_RATIO
+    )
 
 
 def _auto_device() -> torch.device:
@@ -213,13 +259,20 @@ def compute_median_shift_ratio(
     baseline_descriptors: torch.Tensor,
     current_frame: np.ndarray,
     baseline_frame_shape: tuple[int, int] | None = None,
-) -> tuple[float, bool]:
+) -> tuple[float, bool, str, int]:
     """Measure how much matched keypoints have moved between baseline
-    and current frame. Returns (shift_ratio, reliable).
+    and current frame. Returns (shift_ratio, reliable, reason, match_count).
 
     Uses median displacement of MAD-filtered matches (robust to
     outlier matches without fitting any geometric model), normalized
     by frame diagonal (scale-independent across resolutions).
+
+    Reliability requires the match-volume guards (absolute count, relative
+    match ratio, inlier ratio). When they fail, ``reliable`` is False and
+    ``reason`` explains why (TILT_STATUS_*); ``match_count`` reports the
+    number of mutual-NN correspondences for observability. All guard math
+    runs on the on-device tensors -- tensors are pulled to CPU only after
+    the guards pass, so degraded frames never pay the transfer cost.
 
     ``baseline_frame_shape`` is the (height, width) of the frame the
     baseline features were extracted from. When provided, a current
@@ -247,6 +300,7 @@ def compute_median_shift_ratio(
     current_descriptors = None
     _distances = None
     match_idxs = None
+    match_count = 0
     try:
         current_keypoints, current_descriptors = extract_features(current_frame)
 
@@ -255,32 +309,43 @@ def compute_median_shift_ratio(
                 baseline_descriptors, current_descriptors, th=TILT_MATCH_RATIO_THRESHOLD,
             )
 
-        if len(match_idxs) < TILT_MIN_RELIABLE_MATCHES:
+        # Shape metadata is available without transferring tensor data, so
+        # all volume guards run before any .cpu() / .numpy() transfer.
+        match_count = int(match_idxs.shape[0])
+        baseline_kp_count = int(baseline_keypoints.shape[0])
+        current_kp_count = int(current_keypoints.shape[0])
+
+        if not match_volume_sufficient(match_count, baseline_kp_count, current_kp_count):
             logger.warning(
-                "Only %d matches found (need %d); tilt estimate skipped as unreliable.",
-                len(match_idxs), TILT_MIN_RELIABLE_MATCHES,
+                "Only %d matches from %d/%d keypoints (need >= %d and >= %.3f of "
+                "the smaller set); tilt estimate skipped as unreliable.",
+                match_count, baseline_kp_count, current_kp_count,
+                TILT_MIN_RELIABLE_MATCHES, TILT_MIN_MATCH_RATIO,
             )
-            return 0.0, False
+            return 0.0, False, TILT_STATUS_INSUFFICIENT_MATCHES, match_count
 
         points_baseline = baseline_keypoints[match_idxs[:, 0]].cpu().numpy()
         points_current = current_keypoints[match_idxs[:, 1]].cpu().numpy()
 
         displacements = np.linalg.norm(points_current - points_baseline, axis=1)
         inliers = _mad_inlier_mask(displacements)
+        inlier_count = int(inliers.sum())
 
-        if inliers.sum() < TILT_MIN_RELIABLE_MATCHES:
+        if not inlier_ratio_sufficient(inlier_count, match_count):
             logger.warning(
-                "Only %d MAD-filtered inliers (need %d); tilt estimate skipped as unreliable.",
-                inliers.sum(), TILT_MIN_RELIABLE_MATCHES,
+                "Only %d/%d MAD-filtered inliers (need >= %d and ratio >= %.3f); "
+                "tilt estimate skipped as unreliable.",
+                inlier_count, match_count,
+                TILT_MIN_RELIABLE_MATCHES, TILT_MIN_INLIER_RATIO,
             )
-            return 0.0, False
+            return 0.0, False, TILT_STATUS_INSUFFICIENT_MATCHES, match_count
 
         # Median displacement of inlier-filtered matched points,
         # normalized by frame diagonal for scale independence.
         frame_diagonal = np.hypot(width, height)
         shift_ratio = float(np.median(displacements[inliers]) / frame_diagonal)
 
-        return shift_ratio, True
+        return shift_ratio, True, TILT_STATUS_OK, match_count
     finally:
         del current_keypoints, current_descriptors, _distances, match_idxs
 
@@ -296,12 +361,19 @@ def evaluate(
     ``baseline_frame_shape`` is the (height, width) of the frame the
     baseline features were extracted from; see compute_median_shift_ratio.
     """
-    shift_ratio, reliable = compute_median_shift_ratio(
+    shift_ratio, reliable, reason, match_count = compute_median_shift_ratio(
         baseline_keypoints, baseline_descriptors, current_frame, baseline_frame_shape
     )
 
     if not reliable:
-        return TiltResult(median_shift_ratio=0.0, confidence=0.0, is_candidate=False, reliable=False)
+        return TiltResult(
+            median_shift_ratio=0.0,
+            confidence=0.0,
+            is_candidate=False,
+            reliable=False,
+            reason=reason,
+            match_count=match_count,
+        )
 
     is_candidate = shift_ratio >= TILT_MEDIAN_SHIFT_THRESHOLD_RATIO
     # Linear severity map: confidence reaches 1.0 when the median keypoint
@@ -317,4 +389,6 @@ def evaluate(
         confidence=confidence,
         is_candidate=is_candidate,
         reliable=True,
+        reason=reason,
+        match_count=match_count,
     )

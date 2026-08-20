@@ -21,13 +21,16 @@ import numpy as np
 
 from config import (
     BASELINE_CAPTURE_SECONDS,
+    BASELINE_MAX_DARK_RATIO,
+    BASELINE_MIN_SHARPNESS,
     BASELINES_DIR,
     TAMPERING_BASELINE_EDGE_PERSISTENCE_RATIO,
+    TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION,
     validate_config,
 )
 from detectors.blur import compute_sharpness
 from detectors.brightness import compute_dark_pixel_ratio
-from detectors.tampering import compute_edge_map
+from detectors.tampering import compute_edge_map, meaningful_block_fraction
 from pipeline.file_reader import read_frames_from_file
 from pipeline.paths import validate_camera_id
 from pipeline.stream_reader import read_frames
@@ -89,10 +92,40 @@ def capture_baseline(camera_id: str, source: str) -> dict:
     edge_persistence = edge_accumulator / frame_count
     stable_edges = (edge_persistence >= TAMPERING_BASELINE_EDGE_PERSISTENCE_RATIO).astype(np.uint8) * 255
 
+    mean_dark_ratio = sum(dark_ratios) / len(dark_ratios)
+    mean_sharpness = sum(sharpness_values) / len(sharpness_values)
+    structure_fraction = meaningful_block_fraction(stable_edges)
+
+    # Capture-time quality gates. These are warnings (not hard failures):
+    # a genuinely dark/blurry deployment camera still gets a baseline, but
+    # the record is marked so operators see the capture was improper and the
+    # runtime guards (e.g. tampering's degraded-baseline gate) stay honest.
+    quality_warnings: list[str] = []
+    if mean_dark_ratio > BASELINE_MAX_DARK_RATIO:
+        quality_warnings.append(
+            f"mean dark-pixel ratio {mean_dark_ratio:.3f} is above "
+            f"BASELINE_MAX_DARK_RATIO ({BASELINE_MAX_DARK_RATIO}); capture looks too dark"
+        )
+    if mean_sharpness < BASELINE_MIN_SHARPNESS:
+        quality_warnings.append(
+            f"mean Laplacian sharpness {mean_sharpness:.1f} is below "
+            f"BASELINE_MIN_SHARPNESS ({BASELINE_MIN_SHARPNESS}); capture looks blurry"
+        )
+    if structure_fraction < TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION:
+        quality_warnings.append(
+            f"tampering meaningful-block fraction {structure_fraction:.3f} is below "
+            f"TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION "
+            f"({TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION}); structure-loss detection is unreliable"
+        )
+    for warning in quality_warnings:
+        logger.warning("Baseline quality for %s: %s", camera_id, warning)
+
     baseline_record = {
         "camera_id": camera_id,
-        "lowlight_dark_pixel_ratio": sum(dark_ratios) / len(dark_ratios),
-        "blur_baseline_sharpness": sum(sharpness_values) / len(sharpness_values),
+        "lowlight_dark_pixel_ratio": mean_dark_ratio,
+        "blur_baseline_sharpness": mean_sharpness,
+        "tampering_meaningful_block_fraction": structure_fraction,
+        "quality_warnings": quality_warnings,
         "frames_averaged": frame_count,
         "captured_at": time.time(),
     }

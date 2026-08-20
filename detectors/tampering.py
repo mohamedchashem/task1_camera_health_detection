@@ -27,6 +27,7 @@ from config import (
     TAMPERING_MIN_CONTIGUOUS_BLOCK_FRACTION,
     TAMPERING_MAX_GLOBAL_LOSS_FRACTION,
     TAMPERING_MIN_COMPACTNESS_RATIO,
+    TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION,
 )
 
 
@@ -35,6 +36,7 @@ class TamperingResult:
     largest_contiguous_loss_fraction: float  # raw score, 0-1
     confidence: float                         # normalized 0-1 score
     is_candidate: bool                         # single-frame flag; temporal confirmation happens upstream
+    reason: str | None = None                  # optional diagnostic ("degraded_baseline", ...)
 
 
 def compute_edge_map(frame: np.ndarray) -> np.ndarray:
@@ -50,6 +52,46 @@ def _compute_block_density(edge_map: np.ndarray, block_size: int) -> np.ndarray:
     cropped = edge_map[: rows * block_size, : cols * block_size]
     blocks = cropped.reshape(rows, block_size, cols, block_size)
     return (blocks > 0).mean(axis=(1, 3))
+
+
+def meaningful_block_fraction(baseline_edges: np.ndarray) -> float:
+    """Fraction of grid blocks with enough baseline edge structure to count
+    as meaningful for obstruction scoring.
+
+    A baseline with almost no meaningful structure cannot support
+    structure-loss detection: with a handful of meaningful blocks, any small
+    ambient/background shift can look like a compact "lost" cluster. Callers
+    should treat fractions below ``TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION``
+    as a degraded baseline and refuse to emit tampering candidates.
+    """
+    baseline_density = _compute_block_density(baseline_edges, TAMPERING_GRID_BLOCK_SIZE)
+    total = baseline_density.size
+    if total == 0:
+        return 0.0
+    meaningful = np.count_nonzero(
+        baseline_density >= TAMPERING_MIN_BASELINE_BLOCK_EDGE_DENSITY
+    )
+    return meaningful / total
+
+
+def confidence_from_largest_fraction(largest_fraction: float) -> float:
+    """Normalize the largest lost-cluster fraction onto the detector's
+    confidence scale.
+
+    ``largest_fraction`` spans the candidate threshold
+    (``TAMPERING_MIN_CONTIGUOUS_BLOCK_FRACTION``, the smallest reportable
+    obstruction) up to 1.0 (the whole baseline blocked). Mapping that range
+    to 0..1 keeps the scale comparable with the other detectors and makes
+    the confidence floor meaningful: 0.50 on this scale corresponds to
+    ~57.5% of the baseline's structure blocked in one contiguous cluster.
+    """
+    span = 1.0 - TAMPERING_MIN_CONTIGUOUS_BLOCK_FRACTION
+    if span <= 0.0:
+        return float(np.clip(largest_fraction, 0.0, 1.0))
+    normalized = (
+        largest_fraction - TAMPERING_MIN_CONTIGUOUS_BLOCK_FRACTION
+    ) / span
+    return float(np.clip(normalized, 0.0, 1.0))
 
 
 def compute_loss_fractions(
@@ -114,6 +156,20 @@ def compute_largest_contiguous_loss_fraction(baseline_edges: np.ndarray, current
 
 def evaluate(frame: np.ndarray, baseline_edges: np.ndarray) -> TamperingResult:
     """Score a frame's obstruction level relative to a camera's baseline edge map."""
+    # Baseline-quality guard: a baseline captured in dark/blurry conditions
+    # contains meaningful structure in only a small fraction of its blocks,
+    # so its structure-loss metric is dominated by ambient/background noise
+    # rather than real obstruction. Refuse to emit candidates (never a false
+    # tampering event) until a usable baseline is captured. The decision
+    # engine surfaces this as the detector's "reason".
+    if meaningful_block_fraction(baseline_edges) < TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION:
+        return TamperingResult(
+            largest_contiguous_loss_fraction=0.0,
+            confidence=0.0,
+            is_candidate=False,
+            reason="degraded_baseline",
+        )
+
     current_edges = compute_edge_map(frame)
     largest_fraction, total_fraction = compute_loss_fractions(baseline_edges, current_edges)
 
@@ -137,7 +193,7 @@ def evaluate(frame: np.ndarray, baseline_edges: np.ndarray) -> TamperingResult:
     # compactness check degenerates to 0 >= 0 and the min-contiguous check
     # below (largest >= 0.15) correctly rejects the frame.
     is_candidate = localized and largest_fraction >= TAMPERING_MIN_CONTIGUOUS_BLOCK_FRACTION
-    confidence = float(np.clip(largest_fraction, 0.0, 1.0))
+    confidence = confidence_from_largest_fraction(largest_fraction)
 
     return TamperingResult(
         largest_contiguous_loss_fraction=largest_fraction,

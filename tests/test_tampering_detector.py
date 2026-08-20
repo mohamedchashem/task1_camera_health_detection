@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 
 import cv2
+import numpy as np
 import pytest
 
 from config import (
@@ -116,3 +117,34 @@ def test_structure_overlap_faults_are_documented_not_asserted(fixture_data: dict
         "decide whether they belong in STRUCTURE_OVERLAP_FAULT_TYPES or need "
         "a strict false-positive check."
     )
+
+
+def test_evaluate_reports_degraded_baseline_when_structure_is_sparse() -> None:
+    # A baseline with meaningful structure in only 25% of its blocks cannot
+    # support structure-loss detection (dark/blurry capture). The detector
+    # must never emit a candidate from such a baseline -- this is the root
+    # cause of the low-confidence tampering false positive on dark baselines.
+    sparse_edges = np.zeros((64, 64), dtype=np.uint8)
+    sparse_edges[0:32, 0:32] = 255  # one meaningful 32x32 block of four
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+
+    result = evaluate(frame, sparse_edges)
+    assert result.is_candidate is False
+    assert result.confidence == 0.0
+    assert result.reason == "degraded_baseline"
+
+
+def test_evaluate_recalibrated_confidence_on_full_structure_baseline() -> None:
+    # With a sufficient baseline, the recalibrated confidence maps the
+    # largest lost-cluster fraction onto the normalized 0..1 scale:
+    # 0 at the candidate threshold (0.15) and 1.0 at total loss. A frame
+    # with no structure loss is not a candidate and scores 0.
+    full_edges = np.full((64, 64), 255, dtype=np.uint8)  # all 4 blocks meaningful
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    frame[:, :] = (128, 128, 128)  # uniform gray -> no edges in the current frame
+
+    result = evaluate(frame, full_edges)
+    assert not result.is_candidate  # total loss exceeds the global-loss ceiling
+    assert result.reason is None
+    # The normalized confidence still follows the recalibrated scale.
+    assert 0.0 <= result.confidence <= 1.0

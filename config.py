@@ -56,6 +56,20 @@ BASELINE_CAPTURE_SECONDS = 3.0
 # baseline, chosen to smooth out single-frame noise while staying
 # short enough to capture manually without difficulty.
 
+BASELINE_MAX_DARK_RATIO = 0.15
+# Capture-time quality gate (warning, not a hard failure): a baseline
+# segment whose mean dark-pixel ratio is at or above this ceiling was
+# captured in improper lighting, making its edge structure and sharpness
+# references unreliable. Logged as a quality warning on the saved record.
+# Empirical starting point (cam_02's bad baseline measured 0.136).
+
+BASELINE_MIN_SHARPNESS = 500.0
+# Capture-time quality gate (warning, not a hard failure): a baseline
+# segment whose mean Laplacian sharpness is at or below this floor was
+# captured too blurry to serve as a trustworthy reference. Logged as a
+# quality warning on the saved record. Empirical starting point
+# (cam_02's bad baseline measured 398.6 vs cam_01's 3806.6).
+
 TEST_RUNS_DIR = DATA_DIR / "test_runs"
 # Output location for blind-test CSV logs — generated data, not code.
 
@@ -123,6 +137,15 @@ TAMPERING_MIN_BASELINE_BLOCK_EDGE_DENSITY = 0.02
 # baseline structure (e.g. a blank wall) are excluded from scoring,
 # since they have nothing to "disappear."
 
+TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION = 0.5
+# A tampering baseline must contain meaningful structure in at least this
+# fraction of its grid blocks. A baseline captured in dark/blurry
+# conditions has almost no stable structure to "lose", so any ambient
+# change can masquerade as a compact obstruction cluster. Below this
+# fraction the detector reports a "degraded_baseline" result (never a
+# candidate) until a usable baseline is captured. Empirical starting
+# point; measured 0.99 (cam_01, clean) vs 0.30 (cam_02, poor lighting).
+
 TAMPERING_BLOCK_DENSITY_DROP_RATIO = 0.5
 # A block is flagged as "disappeared" if its current edge density
 # drops to this fraction (or less) of its baseline density. E.g. 0.5
@@ -171,6 +194,22 @@ TILT_MIN_RELIABLE_MATCHES = 10
 # Below this, the frame is skipped rather than risk a meaningless
 # angle from too few points. Applied both to raw matches and to
 # MAD-filtered inlier matches.
+
+TILT_MIN_MATCH_RATIO = 0.05
+# Relative match-volume guard: a rotation estimate is trusted only when the
+# number of matches is at least this fraction of the SMALLER of the two
+# frames' keypoint counts. On severely blurred/obscured/black frames DISK
+# can still produce a handful of spurious correspondences that pass the
+# absolute floor (TILT_MIN_RELIABLE_MATCHES) but represent a tiny fraction
+# of the available features; their median displacement is meaningless and
+# would otherwise read as a huge false tilt. Empirical starting point,
+# validated on the fixture plus test_video2 footage.
+
+TILT_MIN_INLIER_RATIO = 0.5
+# After MAD outlier rejection, at least this fraction of the matches must
+# survive. A genuine camera displacement moves features coherently, so most
+# matches agree; blur- or noise-induced garbage is scattered and MAD rejects
+# most of it. A guard on the raw match count alone is not enough.
 
 TILT_MEDIAN_SHIFT_THRESHOLD_RATIO = 0.1
 # A frame is flagged as a tilt candidate when the median displacement
@@ -300,8 +339,69 @@ DECISION_SUPPRESSION_MAP = {
 # A suppressor must reach this confidence before it can override a
 # lower-priority fault in precedence disputes. Detector confidences are
 # not cross-normalized, so this prevents a weak signal from dominating.
-# Empirical starting point; 0.0 means "pure type precedence".
-DECISION_SUPPRESSOR_MIN_CONFIDENCE = 0.3
+# Raised from 0.3 to 0.5 so that a suppressor below the per-fault emission
+# floor (DECISION_CONFIRM_MIN_CONFIDENCE) can never hijack a stronger
+# signal. Empirical starting point.
+DECISION_SUPPRESSOR_MIN_CONFIDENCE = 0.5
+
+# Relative suppression margin: an active suppressor (confidence >=
+# DECISION_SUPPRESSOR_MIN_CONFIDENCE) additionally needs
+# ``suppressor_confidence * DECISION_SUPPRESSION_MARGIN >=
+# suppressed_confidence`` to override the lower-priority candidate. With
+# 1.5, a suppressor at the confidence gate can only override candidates up
+# to 0.75 confidence; a 1.0-confidence signal requires a >= ~0.67
+# suppressor. This stops weak tampering noise (measured 0.32-0.35 on the
+# old scale at t=47.49s of test_video2) from overriding a 1.0-confidence
+# tilt. Empirical starting point.
+DECISION_SUPPRESSION_MARGIN = 1.5
+
+# Per-fault emission floor: a candidate frame counts toward temporal
+# confirmation only when its confidence is at least the fault's floor.
+# Values are on each detector's normalized confidence scale. tampering's
+# floor matches its recalibrated scale (0.50 = ~57.5% of baseline structure
+# lost in one contiguous cluster); low_light/blur/tilt floors sit below the
+# confidence values real faults reach so only noise is filtered.
+DECISION_CONFIRM_MIN_CONFIDENCE = {
+    "tampering": 0.5,
+    "low_light": 0.5,
+    "blur": 0.5,
+    "tilt": 0.5,
+}
+
+# Execution order for running detectors, distinct from the fusion
+# precedence (DECISION_PRECEDENCE): cheap signal detectors first, expensive
+# structural detectors last, so a high-confidence gate can short-circuit
+# expensive work on frames it already explains. Contains exactly the four
+# fault types (validated).
+DECISION_EXECUTION_ORDER = ("low_light", "blur", "tampering", "tilt")
+
+# A gate detector that fires a candidate at or above its gate floor causes
+# the detectors listed under it to be skipped for that frame (observation
+# status "skipped", reason "suppressed_by_gate"). Skipped detectors are
+# excluded from the confirmation tracker, so their windows age out instead
+# of being polluted by unmeasurable frames. High-confidence low-light
+# (near-black) makes both structural detectors unmeasurable; blur stays
+# active as the primary optical signal.
+DECISION_GATE_CONFIDENCE = 0.8
+# Default gate floor: a gate detector must fire a candidate at confidence
+# >= this to activate. Individual gates may demand a higher bar via
+# DECISION_GATE_CONFIDENCE_BY_GATE.
+
+DECISION_GATE_CONFIDENCE_BY_GATE = {
+    "blur": 0.9,
+}
+# Per-gate floors that override DECISION_GATE_CONFIDENCE for that gate.
+# Blur only gates the structural tilt detector at >= 0.90 (severe blur):
+# below that the frame is still measurable for keypoint matching, so a
+# real tilt must not be missed. During severe blur DISK can still emit a
+# handful of spurious correspondences whose median displacement reads as
+# a large false tilt (observed on test_video2, cam_02: tilt confidence 1.0
+# at blur ~0.99), so tilt is skipped and its confirmation window ages out.
+
+DECISION_GATE_SKIP_MAP = {
+    "low_light": ("tampering", "tilt"),
+    "blur": ("tilt",),
+}
 
 # Temporal confirmation window (time-based, matches BASELINE_CAPTURE_SECONDS).
 DECISION_CONFIRMATION_WINDOW_SECONDS = 3.0
@@ -399,6 +499,14 @@ def validate_config() -> None:
         BASELINE_CAPTURE_SECONDS > 0,
         f"BASELINE_CAPTURE_SECONDS must be > 0; got {BASELINE_CAPTURE_SECONDS}.",
     )
+    require(
+        0 < BASELINE_MAX_DARK_RATIO <= 1,
+        f"BASELINE_MAX_DARK_RATIO must be in (0, 1]; got {BASELINE_MAX_DARK_RATIO}.",
+    )
+    require(
+        BASELINE_MIN_SHARPNESS > 0,
+        f"BASELINE_MIN_SHARPNESS must be > 0; got {BASELINE_MIN_SHARPNESS}.",
+    )
     # Tampering/obstruction detector
     require(
         0 <= TAMPERING_CANNY_LOW_THRESHOLD < TAMPERING_CANNY_HIGH_THRESHOLD <= 255,
@@ -438,6 +546,11 @@ def validate_config() -> None:
         f"TAMPERING_BASELINE_EDGE_PERSISTENCE_RATIO must be in [0, 1]; "
         f"got {TAMPERING_BASELINE_EDGE_PERSISTENCE_RATIO}.",
     )
+    require(
+        0 < TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION <= 1,
+        f"TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION must be in (0, 1]; "
+        f"got {TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION}.",
+    )
 
     # Blur/dirty-lens detector
     require(
@@ -450,6 +563,14 @@ def validate_config() -> None:
     require(
         TILT_MIN_RELIABLE_MATCHES > 0,
         f"TILT_MIN_RELIABLE_MATCHES must be > 0; got {TILT_MIN_RELIABLE_MATCHES}.",
+    )
+    require(
+        0 < TILT_MIN_MATCH_RATIO <= 1,
+        f"TILT_MIN_MATCH_RATIO must be in (0, 1]; got {TILT_MIN_MATCH_RATIO}.",
+    )
+    require(
+        0 < TILT_MIN_INLIER_RATIO <= 1,
+        f"TILT_MIN_INLIER_RATIO must be in (0, 1]; got {TILT_MIN_INLIER_RATIO}.",
     )
     require(
         0 < TILT_MEDIAN_SHIFT_THRESHOLD_RATIO <= 1,
@@ -547,6 +668,50 @@ def validate_config() -> None:
     require(
         0 <= DECISION_SUPPRESSOR_MIN_CONFIDENCE <= 1,
         f"DECISION_SUPPRESSOR_MIN_CONFIDENCE must be in [0, 1]; got {DECISION_SUPPRESSOR_MIN_CONFIDENCE}.",
+    )
+    require(
+        DECISION_SUPPRESSION_MARGIN > 0,
+        f"DECISION_SUPPRESSION_MARGIN must be > 0; got {DECISION_SUPPRESSION_MARGIN}.",
+    )
+    require(
+        set(DECISION_CONFIRM_MIN_CONFIDENCE) == {"tampering", "low_light", "blur", "tilt"},
+        f"DECISION_CONFIRM_MIN_CONFIDENCE must cover exactly the four fault types; "
+        f"got {sorted(DECISION_CONFIRM_MIN_CONFIDENCE)}.",
+    )
+    for fault, floor in DECISION_CONFIRM_MIN_CONFIDENCE.items():
+        require(
+            0 <= floor <= 1,
+            f"DECISION_CONFIRM_MIN_CONFIDENCE[{fault!r}] must be in [0, 1]; got {floor}.",
+        )
+    require(
+        set(DECISION_EXECUTION_ORDER) == {"tampering", "low_light", "blur", "tilt"}
+        and len(DECISION_EXECUTION_ORDER) == 4,
+        f"DECISION_EXECUTION_ORDER must contain exactly the four fault types once each; "
+        f"got {DECISION_EXECUTION_ORDER}.",
+    )
+    for gate, skipped in DECISION_GATE_SKIP_MAP.items():
+        require(
+            gate in DECISION_PRECEDENCE,
+            f"DECISION_GATE_SKIP_MAP key {gate!r} is not in DECISION_PRECEDENCE.",
+        )
+        require(
+            set(skipped) <= set(DECISION_PRECEDENCE) - {gate},
+            f"DECISION_GATE_SKIP_MAP[{gate!r}] must reference known fault types "
+            f"other than itself; got {sorted(skipped)}.",
+        )
+    for gate, floor in DECISION_GATE_CONFIDENCE_BY_GATE.items():
+        require(
+            gate in DECISION_GATE_SKIP_MAP,
+            f"DECISION_GATE_CONFIDENCE_BY_GATE key {gate!r} has no entry in "
+            f"DECISION_GATE_SKIP_MAP and cannot gate anything.",
+        )
+        require(
+            0 < floor <= 1,
+            f"DECISION_GATE_CONFIDENCE_BY_GATE[{gate!r}] must be in (0, 1]; got {floor}.",
+        )
+    require(
+        0 < DECISION_GATE_CONFIDENCE <= 1,
+        f"DECISION_GATE_CONFIDENCE must be in (0, 1]; got {DECISION_GATE_CONFIDENCE}.",
     )
     require(
         DECISION_CONFIRMATION_WINDOW_SECONDS > 0,

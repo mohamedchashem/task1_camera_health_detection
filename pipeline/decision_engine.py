@@ -11,18 +11,36 @@ Fault isolation guarantee: a detector that raises is contained per frame
 after repeated consecutive errors a detector is temporarily skipped
 (backoff), then retried automatically.
 
-Fusion contract (approved Phase 1 spec):
+Fusion contract (approved Phase 1 spec, revised for false-positive control):
 - candidates are ranked by ``DECISION_PRECEDENCE`` (higher severity
   first; confidence breaks only ties);
 - the primary is the highest-ranked candidate not suppressed by a
   higher-ranked *active* suppressor (confidence >=
-  ``DECISION_SUPPRESSOR_MIN_CONFIDENCE``);
+  ``DECISION_SUPPRESSOR_MIN_CONFIDENCE`` AND relative margin
+  ``suppressor * DECISION_SUPPRESSION_MARGIN >= suppressed``);
 - an active candidate beats a below-gate candidate of lower precedence;
   if no candidate is active, the top-ranked candidate still becomes
   primary (documented limitation of the V1 rules);
 - ``suppressed_faults`` are the remaining candidates the primary's
   signal explains (``DECISION_SUPPRESSION_MAP``); everything else is a
   ``secondary_symptom``.
+
+Execution gating: detectors run in ``DECISION_EXECUTION_ORDER`` (cheap
+signal detectors first, expensive structural last). A gate detector that
+fires a candidate at or above its gate floor (``DECISION_GATE_CONFIDENCE``,
+overridden per gate by ``DECISION_GATE_CONFIDENCE_BY_GATE``) causes the
+detectors listed under it in ``DECISION_GATE_SKIP_MAP`` to be skipped for
+that frame (status ``skipped``, reason ``suppressed_by_gate``), so e.g. a
+high-confidence low-light frame never runs DISK keypoint matching on
+near-black pixels, and a severely blurred frame (blur >= 0.9) skips the
+unmeasurable tilt detector instead of risking a spurious false tilt.
+Skipped detectors are excluded from the confirmation tracker, so their
+windows age out instead of being polluted by unmeasurable frames.
+
+Emission gating: a candidate frame counts toward temporal confirmation
+only when its confidence reaches the fault's floor in
+``DECISION_CONFIRM_MIN_CONFIDENCE``, so weak noise is never logged as a
+confirmed event.
 """
 
 from __future__ import annotations
@@ -38,11 +56,17 @@ from config import (
     DECISION_CONFIRMATION_MIN_POSITIVE_RATIO,
     DECISION_CONFIRMATION_MIN_WINDOW_FRAMES,
     DECISION_CONFIRMATION_WINDOW_SECONDS,
+    DECISION_CONFIRM_MIN_CONFIDENCE,
     DECISION_DETECTOR_ERROR_BACKOFF_SECONDS,
     DECISION_DETECTOR_MAX_CONSECUTIVE_ERRORS,
+    DECISION_EXECUTION_ORDER,
+    DECISION_GATE_CONFIDENCE,
+    DECISION_GATE_CONFIDENCE_BY_GATE,
+    DECISION_GATE_SKIP_MAP,
     DECISION_MIN_EVENT_GAP_SECONDS,
     DECISION_PRECEDENCE,
     DECISION_SUPPRESSION_MAP,
+    DECISION_SUPPRESSION_MARGIN,
     DECISION_SUPPRESSOR_MIN_CONFIDENCE,
 )
 
@@ -63,6 +87,20 @@ EVENT_STATUS_CLEARED = "cleared"
 
 _FAULT_RANK = {fault: rank for rank, fault in enumerate(DECISION_PRECEDENCE)}
 
+# Tolerance for the relative-margin comparisons: ``suppressor * MARGIN >=
+# suppressed`` must not fail due to binary floating-point rounding.
+_MARGIN_EPSILON = 1e-9
+
+
+def _margin_met(suppressor_confidence: float, suppressed_confidence: float) -> bool:
+    """True when an active suppressor clears the relative margin against the
+    candidate it would suppress (approved formula: suppressor_confidence *
+    DECISION_SUPPRESSION_MARGIN >= suppressed_confidence)."""
+    return (
+        suppressor_confidence * DECISION_SUPPRESSION_MARGIN + _MARGIN_EPSILON
+        >= suppressed_confidence
+    )
+
 
 @dataclass(frozen=True)
 class DetectorObservation:
@@ -73,6 +111,9 @@ class DetectorObservation:
     is_candidate: bool
     confidence: float
     error_message: str | None = None
+    reason: str | None = None   # optional diagnostic for non-error states
+                                # ("suppressed_by_gate", "degraded_baseline",
+                                # tilt TILT_STATUS_*, ...)
 
 
 @dataclass(frozen=True)
@@ -115,12 +156,15 @@ def split_candidates_for_primary(
     Used for per-event annotations: when several detectors confirm on the
     same frame, each event's banner lists the other firing candidates as
     ``suppressed`` (signals ``primary`` causally explains, per
-    ``DECISION_SUPPRESSION_MAP``) or as ``secondary`` symptoms. Input
-    order (precedence) is preserved.
+    ``DECISION_SUPPRESSION_MAP``) or as ``secondary`` symptoms. Output is
+    always ordered by ``DECISION_PRECEDENCE`` regardless of the order the
+    candidate names arrive in (the engine executes detectors in
+    ``DECISION_EXECUTION_ORDER``, which differs from precedence).
     """
+    ranked = sorted(candidate_names, key=lambda f: _FAULT_RANK[f])
     suppressed_set = DECISION_SUPPRESSION_MAP.get(primary, ())
-    suppressed = tuple(f for f in candidate_names if f != primary and f in suppressed_set)
-    secondary = tuple(f for f in candidate_names if f != primary and f not in suppressed_set)
+    suppressed = tuple(f for f in ranked if f != primary and f in suppressed_set)
+    secondary = tuple(f for f in ranked if f != primary and f not in suppressed_set)
     return secondary, suppressed
 
 
@@ -146,24 +190,43 @@ def resolve_primary_fault(
 
     primary: str | None = None
     fallback: str | None = None
+    strongest_active: str | None = None
 
     for i, fault in enumerate(ranked):
         higher = ranked[:i]
         suppressed_by_higher = any(
             candidates[g] >= DECISION_SUPPRESSOR_MIN_CONFIDENCE
+            and _margin_met(candidates[g], candidates[fault])
             and fault in DECISION_SUPPRESSION_MAP.get(g, ())
             for g in higher
         )
         if suppressed_by_higher:
             continue
         if candidates[fault] >= DECISION_SUPPRESSOR_MIN_CONFIDENCE:
-            primary = fault
-            break
+            if strongest_active is None or candidates[fault] > candidates[strongest_active]:
+                strongest_active = fault
+            # The relative-margin rule: an active candidate only takes the
+            # primary over a lower-ranked candidate it would suppress when it
+            # clears the margin against that candidate. A weak suppressor
+            # (e.g. a 0.6 tampering vs a 1.0 tilt) yields to the stronger
+            # lower-ranked signal instead of hijacking it.
+            blocked = any(
+                candidates[lower] >= DECISION_SUPPRESSOR_MIN_CONFIDENCE
+                and not _margin_met(candidates[fault], candidates[lower])
+                for lower in ranked[i + 1:]
+                if lower in DECISION_SUPPRESSION_MAP.get(fault, ())
+            )
+            if not blocked:
+                primary = fault
+                break
+            continue
         if fallback is None:
             fallback = fault
 
     if primary is None:
-        primary = fallback
+        # No active candidate cleared its margin: prefer the strongest active
+        # candidate (by confidence), then the top-ranked below-gate candidate.
+        primary = strongest_active if strongest_active is not None else fallback
     if primary is None:
         return None, (), ()
 
@@ -195,11 +258,14 @@ class ConfirmationTracker:
     """Temporal confirmation state machine for one camera.
 
     Time-based sliding window per fault: a fault is *confirmed* while the
-    fraction of candidate frames among observed frames in the last
+    fraction of positive frames among observed frames in the last
     ``window_seconds`` is at least ``min_positive_ratio`` and at least
-    ``min_window_frames`` frames were observed. Frames where a detector
-    did not run are NOT counted as observations (they are simply not
-    passed to ``update``); their old window entries age out naturally.
+    ``min_window_frames`` frames were observed. A frame counts as a
+    *positive* only when its detector flagged it as a candidate AND its
+    confidence reaches the fault's floor in ``min_confirm_confidence``
+    (emission gating: weak noise never confirms an event). Frames where a
+    detector did not run are NOT counted as observations (they are simply
+    not passed to ``update``); their old window entries age out naturally.
 
     Callers must provide monotonically increasing ``video_time_s``.
     """
@@ -212,6 +278,7 @@ class ConfirmationTracker:
         min_window_frames: int = DECISION_CONFIRMATION_MIN_WINDOW_FRAMES,
         min_event_gap_seconds: float = DECISION_MIN_EVENT_GAP_SECONDS,
         session_id: str = "default",
+        min_confirm_confidence: Mapping[str, float] | None = None,
     ) -> None:
         self._camera_id = camera_id
         self._session_id = session_id
@@ -219,6 +286,11 @@ class ConfirmationTracker:
         self._min_positive_ratio = min_positive_ratio
         self._min_window_frames = min_window_frames
         self._min_event_gap_seconds = min_event_gap_seconds
+        self._min_confirm_confidence = (
+            dict(min_confirm_confidence)
+            if min_confirm_confidence is not None
+            else dict(DECISION_CONFIRM_MIN_CONFIDENCE)
+        )
 
         self._windows: dict[str, deque[tuple[int, float, bool, float]]] = {}
         self._confirmed: set[str] = set()
@@ -252,9 +324,12 @@ class ConfirmationTracker:
 
         for fault in observed:
             window = self._windows.setdefault(fault, deque())
-            window.append(
-                (frame_number, video_time_s, fault in fault_candidates, fault_candidates.get(fault, 0.0))
-            )
+            confidence = fault_candidates.get(fault, 0.0)
+            floor = self._min_confirm_confidence.get(fault, 0.0)
+            # Emission gating: only candidates at/above the fault's floor
+            # count as positive samples toward confirmation.
+            is_positive = fault in fault_candidates and confidence >= floor
+            window.append((frame_number, video_time_s, is_positive, confidence))
 
         cutoff = video_time_s - self._window_seconds
         for fault, window in list(self._windows.items()):
@@ -300,15 +375,15 @@ class ConfirmationTracker:
         count = len(window)
         if count == 0:
             return 0.0, 0
-        positives = sum(1 for _frame, _t, is_candidate, _c in window if is_candidate)
+        positives = sum(1 for _frame, _t, is_positive, _c in window if is_positive)
         return positives / count, count
 
     def _mark_confirmed(self, fault: str, frame_number: int, video_time_s: float) -> None:
         window = self._windows.get(fault, deque())
-        # The event starts at the first candidate frame in the window that
+        # The event starts at the first positive frame in the window that
         # established the confirmation, not at the confirmation frame itself.
         started = next(
-            ((f, t) for f, t, is_candidate, _c in window if is_candidate),
+            ((f, t) for f, t, is_positive, _c in window if is_positive),
             (frame_number, video_time_s),
         )
         self._confirmed.add(fault)
@@ -322,7 +397,7 @@ class ConfirmationTracker:
 
     def _update_peak(self, fault: str) -> None:
         window = self._windows.get(fault, deque())
-        current = max((c for _frame, _t, is_candidate, c in window if is_candidate), default=0.0)
+        current = max((c for _frame, _t, is_positive, c in window if is_positive), default=0.0)
         self._peak_confidence[fault] = max(self._peak_confidence.get(fault, 0.0), current)
 
     def _make_event(
@@ -425,7 +500,13 @@ class DecisionEngine:
                 raise ValueError(f"Unknown fault names in enabled_faults: {sorted(unknown)}")
 
         observations: list[DetectorObservation] = []
-        for name in DECISION_PRECEDENCE:
+        active_gates: dict[str, float] = {}
+        # Execution order is DECISION_EXECUTION_ORDER (cheap signal detectors
+        # first, expensive structural last) so a high-confidence gate can
+        # short-circuit expensive work on frames it already explains. Fusion
+        # ranking is unaffected: resolve_primary_fault re-sorts by
+        # DECISION_PRECEDENCE.
+        for name in DECISION_EXECUTION_ORDER:
             if name not in self._detectors:
                 continue
             if name not in enabled:
@@ -433,9 +514,25 @@ class DecisionEngine:
                     DetectorObservation(name, DETECTOR_STATUS_SKIPPED, False, 0.0)
                 )
                 continue
-            observations.append(
-                self._run_detector(name, self._detectors[name], frame, frame_number, video_time_s)
-            )
+            if self._skipped_by_gate(name, active_gates):
+                observations.append(
+                    DetectorObservation(
+                        name, DETECTOR_STATUS_SKIPPED, False, 0.0,
+                        reason="suppressed_by_gate",
+                    )
+                )
+                continue
+            obs = self._run_detector(name, self._detectors[name], frame, frame_number, video_time_s)
+            observations.append(obs)
+            # A gate detector is only a gate when it actually fired at or
+            # above its per-gate floor this frame.
+            if (
+                obs.status == DETECTOR_STATUS_OK
+                and obs.is_candidate
+                and obs.confidence
+                >= DECISION_GATE_CONFIDENCE_BY_GATE.get(name, DECISION_GATE_CONFIDENCE)
+            ):
+                active_gates[name] = obs.confidence
 
         primary, secondary, suppressed, confidence = fuse_observations(observations)
 
@@ -478,6 +575,14 @@ class DecisionEngine:
         self._pending_events = []
         return events
 
+    def _skipped_by_gate(self, detector: str, active_gates: Mapping[str, float]) -> bool:
+        """True when an already-executed gate detector this frame explains
+        ``detector`` (per ``DECISION_GATE_SKIP_MAP``), so it is skipped."""
+        return any(
+            detector in DECISION_GATE_SKIP_MAP.get(gate, ())
+            for gate in active_gates
+        )
+
     def _run_detector(
         self,
         name: str,
@@ -505,5 +610,11 @@ class DecisionEngine:
             return DetectorObservation(name, DETECTOR_STATUS_ERROR, False, 0.0, str(exc))
 
         self._consecutive_errors[name] = 0
-        return DetectorObservation(name, DETECTOR_STATUS_OK, is_candidate, confidence)
+        return DetectorObservation(
+            name,
+            DETECTOR_STATUS_OK,
+            is_candidate,
+            confidence,
+            reason=getattr(result, "reason", None),
+        )
 

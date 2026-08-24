@@ -9,6 +9,7 @@ __pycache__/
 .pytest_cache/
 
 # Runtime & test data outputs
+output/
 data/test_footage/*
 data/baselines/*
 data/logs/*
@@ -20,6 +21,10 @@ data/*.db-shm
 data/*.db-journal
 data/test_runs/*
 data/debug_frames/*
+*.db
+
+# Keep intentionally committed test fixtures
+!tests/fixtures/*.jsonl
 
 # Build & tooling noise
 *.egg-info/
@@ -30,12 +35,12 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
-# IDE / OS files
+# IDE / OS / Tooling files
 .vscode/
 .idea/
 Thumbs.db
 .DS_Store
 
-# Local AI assistant rules
-.clinerules/
+# Local AI assistant rules & state
 .cline_state/
+.clineignore

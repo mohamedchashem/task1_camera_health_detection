@@ -26,7 +26,7 @@ from pipeline.decision_engine import (
     DecisionFrame,
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 class FrameLogger:
@@ -155,7 +155,10 @@ class FrameLogger:
             "primary_fault": frame.primary_fault,
             "confidence": round(frame.confidence, 6),
             "secondary_symptoms": list(frame.secondary_symptoms),
+            # Causally-suppressed candidates only (subtask-1 redefinition).
             "suppressed_faults": list(frame.suppressed_faults),
+            # Sub-floor candidates (schema v3): too weak to reach fusion.
+            "below_floor_faults": list(frame.below_floor_faults),
             # Multi-label survivors (schema v2): each active fault and its
             # confidence, in DECISION_PRECEDENCE order.
             "faults": [
@@ -165,12 +168,26 @@ class FrameLogger:
                 }
                 for fault in frame.faults
             ],
+            # Temporal truth (schema v3): every fault currently confirmed,
+            # with its peak confidence, in DECISION_PRECEDENCE order. Unlike
+            # ``faults`` this is NOT limited to this frame's survivors.
+            "confirmed_faults": [
+                {
+                    "fault_type": fault.fault_type,
+                    "confidence": round(fault.confidence, 6),
+                }
+                for fault in frame.confirmed_faults
+            ],
             "temporal_status": dict(frame.temporal_confirmation_status),
             "detectors": {
                 obs.detector: {
                     "status": obs.status,
                     "is_candidate": obs.is_candidate,
                     "confidence": round(obs.confidence, 6),
+                    # The detector's original confidence, kept verbatim even
+                    # when the reportable ``confidence`` was zeroed on a
+                    # non-candidate (debugging transparency).
+                    "raw_confidence": round(obs.raw_confidence, 6),
                     "reason": obs.reason,
                     "error_message": obs.error_message,
                 }

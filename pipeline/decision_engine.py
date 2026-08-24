@@ -22,10 +22,21 @@ Fusion contract (multi-label revision, Phase 1):
   for ``conditional`` relations a physical predicate on the two
   candidates' raw metrics (area conservation, near-black floor). Pairs
   absent from the rules are independent and always co-survive;
+- ``classify_candidates`` partitions each frame's candidates into three
+  disjoint buckets: ``survivors`` (exactly the ``resolve_active_faults``
+  output), ``below_floor`` (confidence below the candidate's own emission
+  floor in ``DECISION_CONFIRM_MIN_CONFIDENCE`` -- too weak to ever be
+  suppressed), and ``suppressed`` (cleared its own floor but removed by a
+  surviving higher-precedence fault -- real causal suppression only);
 - survivors become ``DecisionFrame.faults`` in ``DECISION_PRECEDENCE``
   order; ``primary_fault`` is the top-ranking survivor (backward
-  compatible), the remaining survivors are ``secondary_symptoms``, and
-  removed candidates are ``suppressed_faults``;
+  compatible), the remaining survivors are ``secondary_symptoms``;
+  removed floor-clearing candidates are ``suppressed_faults`` and
+  sub-floor candidates are ``below_floor_faults``;
+- ``DecisionFrame.confirmed_faults`` additionally carries every fault
+  currently in the tracker's confirmed state (peak confidence per fault,
+  ``DECISION_PRECEDENCE`` order) -- the camera's full set of
+  currently-confirmed faults, independent of this frame's survivors;
 - the V1 single-primary rules remain available as
   ``resolve_primary_fault`` / ``fuse_observations`` (unchanged behavior).
 
@@ -230,6 +241,14 @@ class DetectorObservation:
                                 # raw measurands the detector exposes on its
                                 # result (see _DETECTOR_METRIC_FIELDS), for
                                 # physical co-occurrence predicate evaluation
+    raw_confidence: float = 0.0
+                                # the detector's raw confidence kept verbatim,
+                                # separate from ``confidence`` so a
+                                # non-candidate's reportable confidence can be
+                                # zeroed without losing the underlying value
+                                # for debugging. The engine populates it on
+                                # every OK observation; the default keeps
+                                # direct constructions in tests working.
 
 
 @dataclass(frozen=True)
@@ -242,6 +261,32 @@ class Fault:
 
     fault_type: str
     confidence: float
+
+
+@dataclass(frozen=True)
+class CandidateClassification:
+    """One frame's candidates partitioned into three disjoint buckets.
+
+    Returned by ``classify_candidates``. Every candidate lands in exactly
+    one bucket:
+
+    - ``survivors``: the fault names of the ``Fault`` objects
+      ``resolve_active_faults`` returns for this frame (reused verbatim --
+      the emission-floor and suppression decision logic lives only there).
+    - ``below_floor``: candidates whose confidence is below their own
+      emission floor in ``DECISION_CONFIRM_MIN_CONFIDENCE``. These never
+      had a chance to be suppressed -- they were just too weak.
+    - ``suppressed``: candidates that clear their own floor but did NOT
+      survive fusion, i.e. were removed by ``_pair_should_suppress``
+      against a surviving higher-precedence fault. Real causal
+      suppression only -- never a sub-floor candidate.
+
+    The three buckets are pairwise disjoint and cover every candidate.
+    """
+
+    survivors: frozenset[str]
+    below_floor: frozenset[str]
+    suppressed: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -261,6 +306,21 @@ class DecisionFrame:
     # callers that construct a frame from persisted data working; the engine
     # always populates this field.
     faults: tuple[Fault, ...] = ()
+    # Sub-floor candidates (confidence below DECISION_CONFIRM_MIN_CONFIDENCE
+    # for their own fault) -- too weak to even be considered for causal
+    # suppression, unlike suppressed_faults. Default keeps callers that
+    # construct a frame from persisted data working; the engine always
+    # populates this field.
+    below_floor_faults: tuple[str, ...] = ()
+    # The full set of faults currently in the temporal tracker's confirmed
+    # state (each with its peak confidence), in DECISION_PRECEDENCE order.
+    # Unlike ``faults`` this is NOT limited to this frame's survivors: a
+    # fault confirmed moments ago stays listed even when this frame's
+    # detectors no longer flag it. Default keeps callers that construct a
+    # frame from persisted data working; the engine always populates this
+    # field. Not consumed by any renderer yet (wired in a later banner-fix
+    # subtask).
+    confirmed_faults: tuple[Fault, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -423,6 +483,53 @@ def resolve_active_faults(
     return tuple(survivors)
 
 
+def classify_candidates(
+    candidates: Mapping[str, DetectorObservation],
+) -> CandidateClassification:
+    """Partition one frame's candidates into survivors, below-floor, and
+    causally-suppressed buckets.
+
+    Pure function. Reuses ``resolve_active_faults`` for the survivor
+    decision instead of reimplementing it: the ``survivors`` bucket is
+    exactly the names of the ``Fault`` objects that function returns.
+
+    Every candidate lands in exactly one bucket:
+
+    - ``survivors``: cleared its own emission floor and survived fusion;
+    - ``below_floor``: confidence below its own floor in
+      ``DECISION_CONFIRM_MIN_CONFIDENCE`` (too weak to be considered for
+      suppression at all -- it never had a chance to be suppressed);
+    - ``suppressed``: cleared its own floor but was removed by a surviving
+      higher-precedence fault via ``_pair_should_suppress`` (real causal
+      suppression only).
+
+    Args:
+        candidates: mapping fault_type -> ``DetectorObservation`` for faults
+            flagged as candidates by their detector this frame (status
+            ``ok``). Fault names must be in ``DECISION_PRECEDENCE``.
+
+    Returns:
+        The three disjoint buckets as frozen sets of fault-type names.
+    """
+    survivors = frozenset(
+        fault.fault_type for fault in resolve_active_faults(candidates)
+    )
+    below_floor = frozenset(
+        fault
+        for fault, observation in candidates.items()
+        if observation.confidence < DECISION_CONFIRM_MIN_CONFIDENCE.get(fault, 0.0)
+    )
+    # Remaining candidates clear their own floor but are not among the
+    # survivors, so ``resolve_active_faults`` must have removed them as
+    # causally suppressed by a surviving higher-precedence fault.
+    suppressed = frozenset(candidates) - survivors - below_floor
+    return CandidateClassification(
+        survivors=survivors,
+        below_floor=below_floor,
+        suppressed=suppressed,
+    )
+
+
 def fuse_observations(
     observations: Sequence[DetectorObservation],
 ) -> tuple[str | None, tuple[str, ...], tuple[str, ...], float]:
@@ -552,6 +659,21 @@ class ConfirmationTracker:
         return {
             fault: TEMPORAL_STATUS_CONFIRMED if fault in self._confirmed else TEMPORAL_STATUS_PENDING
             for fault in self._windows
+        }
+
+    def confirmed_peaks(self) -> dict[str, float]:
+        """Peak confidence of every fault currently in the confirmed state.
+
+        Read-only snapshot of the tracker's existing state: returns
+        ``{fault_type: peak_confidence}`` for each fault currently
+        confirmed (``self._confirmed``), using the running peak the tracker
+        already maintains in ``self._peak_confidence`` -- no recomputation
+        and no change to the confirmation logic. Faults not currently
+        confirmed (or never observed) are absent.
+        """
+        return {
+            fault: self._peak_confidence.get(fault, 0.0)
+            for fault in self._confirmed
         }
 
     def _can_confirm_now(self, fault: str, video_time_s: float) -> bool:
@@ -728,13 +850,22 @@ class DecisionEngine:
             for obs in observations
             if obs.status == DETECTOR_STATUS_OK and obs.is_candidate
         }
-        # Multi-label fusion: survivors are the candidates that clear their
-        # per-fault emission floor (DECISION_CONFIRM_MIN_CONFIDENCE) and are
-        # not removed by a surviving higher-precedence active suppressor
-        # (_pair_should_suppress: DECISION_SUPPRESSION_RULES relation class +
-        # relative margin, reading the two observations' metrics).
-        faults = resolve_active_faults(candidates)
-        survivor_names = {fault.fault_type for fault in faults}
+        # Multi-label fusion: classify_candidates partitions the frame's
+        # candidates into survivors (resolve_active_faults output, reused
+        # verbatim -- no reimplementation), sub-floor candidates (below their
+        # own emission floor in DECISION_CONFIRM_MIN_CONFIDENCE), and
+        # causally-suppressed candidates (cleared their floor but removed by
+        # a surviving higher-precedence fault via _pair_should_suppress).
+        classification = classify_candidates(candidates)
+        # Survivors in DECISION_PRECEDENCE order: resolve_active_faults
+        # visits candidates in precedence rank, so ranking the survivor names
+        # reproduces its output order exactly.
+        faults = tuple(
+            Fault(fault_type=name, confidence=candidates[name].confidence)
+            for name in sorted(
+                classification.survivors, key=lambda fault: _FAULT_RANK[fault]
+            )
+        )
 
         # A candidate removed by the precedence rules (its signal is explained
         # by a surviving fault's physical cause) is not independent evidence:
@@ -752,17 +883,39 @@ class DecisionEngine:
             self._tracker.update(tracker_candidates, observed, frame_number, video_time_s)
         )
 
+        # Full set of currently-confirmed faults for this camera, read from
+        # the tracker's confirmed state (existing peaks, no recomputation),
+        # in DECISION_PRECEDENCE order. This deliberately includes faults
+        # confirmed on earlier frames that this frame's detectors no longer
+        # flag -- it is the temporal truth, not the per-frame survivor list.
+        confirmed_faults = tuple(
+            Fault(fault_type=name, confidence=peak)
+            for name, peak in sorted(
+                self._tracker.confirmed_peaks().items(),
+                key=lambda item: _FAULT_RANK[item[0]],
+            )
+        )
+
         # Backward-compatible single-fault view of the multi-label result:
         # primary is the top-ranking survivor; the remaining survivors are
-        # secondary symptoms; every candidate that did not survive fusion is
-        # a suppressed fault.
+        # secondary symptoms; floor-clearing candidates removed by a survivor
+        # are suppressed_faults and sub-floor candidates are below_floor_faults
+        # (the two buckets are disjoint and together replace the old mixed
+        # "did not survive fusion" bucket). Both keep precedence order.
         primary = faults[0].fault_type if faults else None
         confidence = faults[0].confidence if faults else 0.0
         secondary = tuple(fault.fault_type for fault in faults[1:])
         suppressed = tuple(
             fault
-            for fault in sorted(candidates, key=lambda name: _FAULT_RANK[name])
-            if fault not in survivor_names
+            for fault in sorted(
+                classification.suppressed, key=lambda name: _FAULT_RANK[name]
+            )
+        )
+        below_floor = tuple(
+            fault
+            for fault in sorted(
+                classification.below_floor, key=lambda name: _FAULT_RANK[name]
+            )
         )
 
         return DecisionFrame(
@@ -773,6 +926,8 @@ class DecisionEngine:
             confidence=confidence,
             secondary_symptoms=secondary,
             suppressed_faults=suppressed,
+            below_floor_faults=below_floor,
+            confirmed_faults=confirmed_faults,
             temporal_confirmation_status=self._tracker.confirmation_status(),
             detectors=tuple(observations),
             faults=faults,
@@ -806,7 +961,15 @@ class DecisionEngine:
         try:
             result = detector_call(frame)
             is_candidate = bool(result.is_candidate)
-            confidence = float(result.confidence)
+            raw_confidence = float(result.confidence)
+            # Reportable confidence is zeroed when the detector itself says
+            # this frame is not a valid candidate -- a non-candidate must not
+            # present a high confidence that reads as a contradiction in logs
+            # (observed: tampering confidence 1.0 with is_candidate False).
+            # The raw value is preserved separately (raw_confidence) for
+            # debugging. Inert for all decision paths, which only ever read
+            # confidence of is_candidate observations (see step-3 audit).
+            confidence = raw_confidence if is_candidate else 0.0
         except Exception as exc:  # noqa: BLE001 - containment is the point
             self._consecutive_errors[name] = self._consecutive_errors.get(name, 0) + 1
             if self._consecutive_errors[name] >= self._max_consecutive_errors:
@@ -826,5 +989,6 @@ class DecisionEngine:
             confidence,
             reason=getattr(result, "reason", None),
             metrics=_extract_detector_metrics(name, result),
+            raw_confidence=raw_confidence,
         )
 

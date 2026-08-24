@@ -43,6 +43,7 @@ from main import (
     parse_args,
     resolve_device,
 )
+from pipeline.annotate import build_annotation_lines
 from pipeline.event_store import EventStore
 from pipeline.frame_logger import FrameLogger
 
@@ -91,6 +92,22 @@ def _detectors(**results: _Result) -> dict[str, _Detector]:
 def _inject_frames(monkeypatch: pytest.MonkeyPatch, frames: list) -> None:
     """Route the worker's reader sub-thread to synthetic frames."""
     monkeypatch.setattr(main_module, "_make_frame_source", lambda src: list(frames))
+
+
+def _marker_frame(frame_number: int) -> np.ndarray:
+    frame = _frame()
+    frame[0, 0, 0] = frame_number
+    return frame
+
+
+class _ScriptedDetector:
+    """Returns a scripted result keyed by the frame-number marker."""
+
+    def __init__(self, by_frame: dict[int, _Result]) -> None:
+        self.by_frame = by_frame
+
+    def __call__(self, frame: np.ndarray) -> _Result:
+        return self.by_frame.get(int(frame[0, 0, 0]), _Result(False, 0.0))
 
 
 @pytest.fixture
@@ -462,20 +479,6 @@ def test_worker_annotates_each_event_with_its_own_fault(tmp_path: Path, monkeypa
     # On every confirmation frame the other detectors still fire as
     # candidates, so the per-event secondary/suppressed banner lists below
     # are exercised.
-    def _marker_frame(frame_number: int) -> np.ndarray:
-        frame = _frame()
-        frame[0, 0, 0] = frame_number
-        return frame
-
-    class _ScriptedDetector:
-        """Returns a scripted result keyed by the frame-number marker."""
-
-        def __init__(self, by_frame: dict[int, _Result]) -> None:
-            self.by_frame = by_frame
-
-        def __call__(self, frame: np.ndarray) -> _Result:
-            return self.by_frame.get(int(frame[0, 0, 0]), _Result(False, 0.0))
-
     frames = [
         (1, 1.0, _marker_frame(1)),
         (2, 2.0, _marker_frame(2)),
@@ -530,10 +533,23 @@ def test_worker_annotates_each_event_with_its_own_fault(tmp_path: Path, monkeypa
 
     def _fake_annotate(frame, primary_fault, confidence,
                        secondary_symptoms=(), suppressed_faults=(), video_time_s=None,
-                       faults=()):
-        annotations.append(
-            (primary_fault, confidence, tuple(secondary_symptoms), tuple(suppressed_faults))
-        )
+                       faults=(), confirmed_faults=(), pending_faults=(),
+                       below_floor_faults=(), unmeasurable_faults=()):
+        annotations.append({
+            "primary": primary_fault,
+            "confidence": confidence,
+            "faults": tuple((fault.fault_type, fault.confidence) for fault in faults),
+            "confirmed": tuple(
+                (fault.fault_type, fault.confidence) for fault in confirmed_faults
+            ),
+            "pending": tuple(
+                (fault.fault_type, fault.confidence) for fault in pending_faults
+            ),
+            "suppressed": tuple(suppressed_faults),
+            "below_floor": tuple(below_floor_faults),
+            "unmeasurable": tuple(unmeasurable_faults),
+            "t": video_time_s,
+        })
         return frame
 
     def _fake_save(frame, camera_id, fault_type, frame_number, video_time_s,
@@ -555,29 +571,294 @@ def test_worker_annotates_each_event_with_its_own_fault(tmp_path: Path, monkeypa
     assert len(saved) == 3
     assert sorted(fault for fault, _, _ in saved) == ["blur", "tampering", "tilt"]
 
-    banner = {
-        fault: (primary, confidence, secondary, suppressed)
-        for (primary, confidence, secondary, suppressed), (fault, _, _)
-        in zip(annotations, saved)
+    banner = {fault: render for render, (fault, _, _) in zip(annotations, saved)}
+
+    # The banner primary still matches the event's own detector for every file
+    # and confidence is the event's own peak confidence.
+    assert banner["blur"]["primary"] == "blur"
+    assert banner["tampering"]["primary"] == "tampering"
+    assert banner["tilt"]["primary"] == "tilt"
+    assert banner["blur"]["confidence"] == pytest.approx(0.9)
+    assert banner["tampering"]["confidence"] == pytest.approx(0.8)
+    assert banner["tilt"]["confidence"] == pytest.approx(0.7)
+
+    # The five banner sections are now sourced from the confirming frame's
+    # DecisionFrame, not a per-event re-partition of the candidates.
+    # - tampering confirms on frame 3: blur is causally suppressed by it
+    #   (obstruction explains the sharpness loss) and tilt was gate-skipped
+    #   by the blur gate -> unmeasurable. No pending survivors.
+    assert [name for name, _ in banner["tampering"]["confirmed"]] == ["tampering"]
+    assert banner["tampering"]["pending"] == ()
+    assert banner["tampering"]["suppressed"] == ("blur",)
+    assert banner["tampering"]["below_floor"] == ()
+    assert banner["tampering"]["unmeasurable"] == ("tilt",)
+    # - blur confirms on frame 7: tampering fires below its emission floor
+    #   (0.1 < 0.5) -> "too weak"; tilt is again gate-skipped.
+    assert [name for name, _ in banner["blur"]["confirmed"]] == ["blur"]
+    assert banner["blur"]["pending"] == ()
+    assert banner["blur"]["suppressed"] == ()
+    assert banner["blur"]["below_floor"] == ("tampering",)
+    assert banner["blur"]["unmeasurable"] == ("tilt",)
+    # - tilt confirms on frame 13: blur is causally suppressed by tilt
+    #   (rotation resampling lowers sharpness); tampering is below floor.
+    assert [name for name, _ in banner["tilt"]["confirmed"]] == ["tilt"]
+    assert banner["tilt"]["pending"] == ()
+    assert banner["tilt"]["suppressed"] == ("blur",)
+    assert banner["tilt"]["below_floor"] == ("tampering",)
+    assert banner["tilt"]["unmeasurable"] == ()
+
+
+def test_worker_snapshot_renders_overlapping_confirmed_faults(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # cam_05 overlap pattern: two faults confirm in overlapping temporal
+    # windows. The second event's snapshot render call must receive BOTH
+    # faults in confirmed_faults (the tracker's temporal truth), not just the
+    # fault confirming on this exact frame.
+    frames = [
+        (1, 1.0, _marker_frame(1)),
+        (2, 2.0, _marker_frame(2)),
+        (3, 3.0, _marker_frame(3)),
+        (4, 4.0, _marker_frame(4)),
+        (5, 5.0, _marker_frame(5)),
+        (6, 6.0, _marker_frame(6)),
+    ]
+    _inject_frames(monkeypatch, frames)
+    dets = {
+        # tampering confirms at frame 3 and stays confirmed through frame 6.
+        "tampering": _ScriptedDetector({
+            1: _Result(True, 0.8),
+            2: _Result(True, 0.8),
+            3: _Result(True, 0.8),
+            4: _Result(True, 0.8),
+            5: _Result(True, 0.8),
+            6: _Result(True, 0.8),
+        }),
+        # low_light confirms at frame 6 while tampering is still confirmed.
+        "low_light": _ScriptedDetector({
+            4: _Result(True, 0.7),
+            5: _Result(True, 0.7),
+            6: _Result(True, 0.7),
+        }),
+        "blur": _Detector(_Result(False, 0.0)),
+        "tilt": _Detector(_Result(False, 0.0)),
     }
+    event_frames = tmp_path / "event_frames"
+    renders = []
+    saved = []
 
-    # The banner primary matches the event's own detector for every file.
-    assert banner["blur"][0] == "blur"
-    assert banner["tampering"][0] == "tampering"
-    assert banner["tilt"][0] == "tilt"
+    def _fake_annotate(frame, primary_fault, confidence,
+                       secondary_symptoms=(), suppressed_faults=(), video_time_s=None,
+                       faults=(), confirmed_faults=(), pending_faults=(),
+                       below_floor_faults=(), unmeasurable_faults=()):
+        renders.append({
+            "fault_type": primary_fault,
+            "confirmed": tuple(
+                (fault.fault_type, fault.confidence) for fault in confirmed_faults
+            ),
+            "pending": tuple(
+                (fault.fault_type, fault.confidence) for fault in pending_faults
+            ),
+        })
+        return frame
 
-    # Confidence is the event's own peak confidence, not the fused primary's.
-    assert banner["blur"][1] == pytest.approx(0.9)
-    assert banner["tampering"][1] == pytest.approx(0.8)
-    assert banner["tilt"][1] == pytest.approx(0.7)
+    def _fake_save(frame, camera_id, fault_type, frame_number, video_time_s,
+                   event_frames_dir=event_frames, max_total=config.EVENT_FRAMES_MAX_TOTAL):
+        saved.append(fault_type)
+        return event_frames / f"{camera_id}_{fault_type}_{frame_number}.jpg"
 
-    # Secondary/suppressed lists are relative to each event's detector.
-    assert banner["tampering"][2] == ()                     # secondary
-    assert banner["tampering"][3] == ("blur",)              # suppressed (tilt was gated/skipped)
-    assert banner["blur"][2] == ("tampering",)              # secondary (tampering fires below its floor at frame 7; tilt gated/skipped)
-    assert banner["blur"][3] == ()
-    assert banner["tilt"][2] == ("tampering",)              # secondary
-    assert banner["tilt"][3] == ("blur",)                   # suppressed
+    monkeypatch.setattr(main_module, "annotate_frame", _fake_annotate)
+    monkeypatch.setattr(main_module, "save_annotated_frame", _fake_save)
+
+    worker = CameraWorker(
+        "cam1", "missing.mp4", detectors=dets, event_frames_dir=event_frames
+    )
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+
+    # Two confirmed events (tampering at frame 3, low_light at frame 6).
+    assert sorted(saved) == ["low_light", "tampering"]
+    by_event = {render["fault_type"]: render for render in renders}
+
+    # tampering confirms alone at frame 3.
+    assert by_event["tampering"]["confirmed"] == (("tampering", 0.8),)
+    # low_light confirms at frame 6 while tampering remains temporally
+    # confirmed -> the snapshot render call receives BOTH faults.
+    assert by_event["low_light"]["confirmed"] == (
+        ("tampering", 0.8),
+        ("low_light", 0.7),
+    )
+    # Both are confirmed, so neither is listed as pending (frame confidence).
+    assert by_event["low_light"]["pending"] == ()
+
+
+def test_worker_snapshot_marks_gate_skipped_confirmed_fault_unmeasurable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # cam_06 t=31.53s pattern: on the frame a fault confirms, another
+    # already-confirmed fault's detector is gate-skipped (observation status
+    # "skipped", reason "suppressed_by_gate"). The banner must render that
+    # confirmed fault with the [unmeasurable] marker (and the remaining
+    # gate-skipped detectors on the unmeasurable: line), not silently drop it.
+    frames = [
+        (1, 1.0, _marker_frame(1)),
+        (2, 2.0, _marker_frame(2)),
+        (3, 3.0, _marker_frame(3)),
+        (4, 3.5, _marker_frame(4)),
+        (5, 4.0, _marker_frame(5)),
+        (6, 4.5, _marker_frame(6)),
+        (7, 5.0, _marker_frame(7)),
+    ]
+    _inject_frames(monkeypatch, frames)
+    dets = {
+        # tampering confirms at frame 3 and stays temporally confirmed into
+        # frame 7, where the low_light gate skips it.
+        "tampering": _ScriptedDetector({
+            1: _Result(True, 0.8),
+            2: _Result(True, 0.8),
+            3: _Result(True, 0.8),
+            4: _Result(True, 0.8),
+            5: _Result(True, 0.8),
+            6: _Result(True, 0.8),
+        }),
+        # low_light confirms at frame 7; at >= its gate floor (0.8) it makes
+        # tampering and tilt unmeasurable that frame (skipped_by_gate).
+        "low_light": _ScriptedDetector({
+            5: _Result(True, 0.7),
+            6: _Result(True, 0.7),
+            7: _Result(True, 0.85),
+        }),
+        "blur": _Detector(_Result(False, 0.0)),
+        "tilt": _Detector(_Result(False, 0.0)),
+    }
+    event_frames = tmp_path / "event_frames"
+
+    real_annotate = main_module.annotate_frame
+    captured = []
+
+    def _spy(frame, primary_fault, confidence, **kwargs):
+        captured.append({"primary": primary_fault, "confidence": confidence, **kwargs})
+        return real_annotate(frame, primary_fault, confidence, **kwargs)
+
+    monkeypatch.setattr(main_module, "annotate_frame", _spy)
+
+    worker = CameraWorker(
+        "cam1", "missing.mp4", detectors=dets, event_frames_dir=event_frames
+    )
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+
+    by_event = {render["primary"]: render for render in captured}
+    assert set(by_event) == {"tampering", "low_light"}
+
+    # tampering confirms at frame 3 with no gate active.
+    assert [fault.fault_type for fault in by_event["tampering"]["confirmed_faults"]] == [
+        "tampering"
+    ]
+    assert tuple(by_event["tampering"]["unmeasurable_faults"]) == ()
+
+    # low_light confirms at frame 7 where its gate skips tampering + tilt.
+    # tampering is still temporally confirmed -> annotate marks its FAULT
+    # line [unmeasurable]; tilt is gate-skipped but not confirmed.
+    low_light_render = by_event["low_light"]
+    assert [fault.fault_type for fault in low_light_render["confirmed_faults"]] == [
+        "tampering",
+        "low_light",
+    ]
+    assert tuple(low_light_render["unmeasurable_faults"]) == ("tampering", "tilt")
+
+    lines = build_annotation_lines(
+        low_light_render["primary"],
+        low_light_render["confidence"],
+        suppressed_faults=low_light_render["suppressed_faults"],
+        video_time_s=low_light_render["video_time_s"],
+        faults=low_light_render["faults"],
+        confirmed_faults=low_light_render["confirmed_faults"],
+        pending_faults=low_light_render["pending_faults"],
+        below_floor_faults=low_light_render["below_floor_faults"],
+        unmeasurable_faults=low_light_render["unmeasurable_faults"],
+    )
+    assert "FAULT: tampering (conf=0.80) [unmeasurable]" in lines
+    assert "FAULT: low_light (conf=0.85)" in lines
+    assert "unmeasurable: tilt" in lines
+
+
+def test_worker_snapshot_renders_confirmed_fault_without_current_candidates(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # cam_05 pattern: a confirmation can fire on a frame with zero current
+    # candidates (the fault confirms via its trailing 3-second window, not
+    # this exact frame). decision.faults is empty but decision.confirmed_faults
+    # is not -- the renderer must not crash or produce an empty banner.
+    frames = [
+        (1, 1.0, _marker_frame(1)),
+        (2, 2.0, _marker_frame(2)),
+        (3, 3.0, _marker_frame(3)),
+    ]
+    _inject_frames(monkeypatch, frames)
+    dets = {
+        # Two positive frames then an observed-but-not-candidate frame: the
+        # window [p, p, n] still meets the confirmation ratio (2/3 >= 0.5),
+        # so tampering confirms on frame 3 while no detector is a candidate.
+        "tampering": _ScriptedDetector({
+            1: _Result(True, 0.8),
+            2: _Result(True, 0.8),
+            3: _Result(False, 0.0),
+        }),
+        "low_light": _Detector(_Result(False, 0.0)),
+        "blur": _Detector(_Result(False, 0.0)),
+        "tilt": _Detector(_Result(False, 0.0)),
+    }
+    event_frames = tmp_path / "event_frames"
+    renders = []
+    saved = []
+
+    def _fake_annotate(frame, primary_fault, confidence,
+                       secondary_symptoms=(), suppressed_faults=(), video_time_s=None,
+                       faults=(), confirmed_faults=(), pending_faults=(),
+                       below_floor_faults=(), unmeasurable_faults=()):
+        renders.append({
+            "fault_type": primary_fault,
+            "faults": tuple((fault.fault_type, fault.confidence) for fault in faults),
+            "confirmed": tuple(
+                (fault.fault_type, fault.confidence) for fault in confirmed_faults
+            ),
+            "pending": tuple(
+                (fault.fault_type, fault.confidence) for fault in pending_faults
+            ),
+            "suppressed": tuple(suppressed_faults),
+            "below_floor": tuple(below_floor_faults),
+            "unmeasurable": tuple(unmeasurable_faults),
+        })
+        return frame
+
+    def _fake_save(frame, camera_id, fault_type, frame_number, video_time_s,
+                   event_frames_dir=event_frames, max_total=config.EVENT_FRAMES_MAX_TOTAL):
+        saved.append(fault_type)
+        return event_frames / f"{camera_id}_{fault_type}_{frame_number}.jpg"
+
+    monkeypatch.setattr(main_module, "annotate_frame", _fake_annotate)
+    monkeypatch.setattr(main_module, "save_annotated_frame", _fake_save)
+
+    worker = CameraWorker(
+        "cam1", "missing.mp4", detectors=dets, event_frames_dir=event_frames
+    )
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+
+    assert saved == ["tampering"]
+    render = renders[0]
+    # No current-frame survivor at all on the confirming frame...
+    assert render["faults"] == ()
+    # ...but the event still renders from the temporal truth (confirmed_faults).
+    assert render["confirmed"] == (("tampering", 0.8),)
+    assert render["pending"] == ()
+    assert render["suppressed"] == ()
+    assert render["below_floor"] == ()
+    assert render["unmeasurable"] == ()
 
 
 def test_worker_backpressure_drops_oldest(monkeypatch) -> None:

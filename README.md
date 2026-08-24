@@ -57,6 +57,8 @@ The `DecisionEngine` consolidates per-frame detector outputs into a fused decisi
 
 - **Temporal confirmation** — a single-frame candidate does not constitute a confirmed event. A `ConfirmationTracker` maintains a time-based sliding window per fault type; a fault is confirmed only when positive frames constitute a minimum ratio of observed frames within that window.
 
+- **Raw vs reportable confidence** — the engine preserves each detector's raw confidence verbatim in `DetectorObservation.raw_confidence` while the reportable `confidence` (the value used by decision paths, logs, and banners) is zeroed whenever the detector says the frame is not a valid candidate. A non-candidate therefore can never present a high confidence that reads as a contradiction (observed: tampering confidence 1.0 with `is_candidate=False`). Logs and banners display the reportable `confidence` and carry `raw_confidence` for debugging.
+
 - **Fault isolation and backoff** — a detector exception is contained at the frame level without halting other detectors. A detector that exceeds its consecutive-error threshold is temporarily skipped and automatically retried after a backoff period.
 
 - **Event-rate limiting** — a minimum gap interval prevents the same fault from re-confirming in rapid succession.
@@ -64,9 +66,21 @@ The `DecisionEngine` consolidates per-frame detector outputs into a fused decisi
 ### 1.4 Persistence Layer
 
 - **Event Store** — structured database with parameterized queries, schema versioning, and idempotent writes via composite keys, making event re-emission after restarts a no-op.
-- **Diagnostic Logs** — per-stream JSONL logs, size-rotated and retention-configured.
+- **Diagnostic Logs** — per-stream JSONL logs (frame-log schema v3), size-rotated and retention-configured. Each frame record carries the full banner-fix fields: `confirmed_faults`, `faults` (current survivors), `suppressed_faults` (causally-suppressed only), `below_floor_faults`, `temporal_status`, and per-detector `raw_confidence` alongside the reportable `confidence`.
 - **Annotated Snapshots** — confirmed-fault images retained up to a bounded maximum count.
 - **System Metrics** — periodic per-stream throughput, latency, and drop-rate snapshots, written to a rotated log.
+
+### 1.5 Annotated Snapshot Banner
+
+Confirmed-fault snapshots render a five-section banner in which every fault type appears in exactly ONE section (the exclusivity invariant). Each section honestly means one thing:
+
+1. `FAULT: <type> (conf=<peak>)` — **confirmed** faults currently in the temporal tracker, shown with their peak confidence. A confirmed fault whose detector was gate-skipped this exact frame carries a `[unmeasurable]` marker on its own FAULT line (never a second listing).
+2. `pending: <type> (conf=<frame>)` — current fusion **survivors** not yet confirmed, shown with their frame confidence.
+3. `suppressed: <type>[, <type>]` — candidates that cleared their own emission floor but were removed by a surviving higher-precedence fault via a predicate-gated causal relation (physical cause-and-effect only).
+4. `too weak: <type>[, <type>]` — candidates **below their own emission floor**; they never reached fusion, so they are shown as too weak, never mislabeled "suppressed".
+5. `unmeasurable: <type>[, <type>]` — detectors gate-skipped this frame (`status="skipped"`, `reason="suppressed_by_gate"`); their signal is not meaningful under the frame's conditions, so they are surfaced instead of silently vanishing.
+
+The legacy `DECISION_SUPPRESSION_MAP` (the V1 flat map) is consumed ONLY by the legacy test-only single-primary path (`resolve_primary_fault` / `fuse_observations`); it is **never** used by the live snapshot rendering path, which sources all five sections from `DecisionFrame` fields (`confirmed_faults`, `faults`, `suppressed_faults`, `below_floor_faults`, and gate-skip status). The per-frame diagnostic log (schema v3) persists the same fields so any frame can be replayed offline through the fixed pipeline.
 
 ---
 
@@ -218,7 +232,7 @@ All configuration constants are defined in `config.py`.
 | Decision | `DECISION_CONFIRM_MIN_CONFIDENCE` | `{tampering: 0.5, low_light: 0.5, blur: 0.5, tilt: 0.5}` | Per-fault min confidence to enter confirmation window |
 | Decision | `DECISION_SUPPRESSOR_MIN_CONFIDENCE` | 0.50 | Min confidence for a fault to suppress another |
 | Decision | `DECISION_SUPPRESSION_MARGIN` | 1.5 | Relative margin suppressor must clear |
-| Decision | `DECISION_SUPPRESSION_MAP` | `{...}` | Legacy single-primary suppression map: which candidates a primary fault causally explains. Used only by the legacy single-primary path (`resolve_primary_fault` / `fuse_observations`), not by the multi-label path |
+| Decision | `DECISION_SUPPRESSION_MAP` | `{...}` | Legacy single-primary suppression map: which candidates a primary fault causally explains. Consumed ONLY by the legacy test-only single-primary path (`resolve_primary_fault` / `fuse_observations`); never used by the live snapshot rendering path (which uses the predicate-gated `DECISION_SUPPRESSION_RULES` fields) |
 | Decision | `DECISION_SUPPRESSION_RULES` | `{...}` | Per-pair relation classes for multi-label suppression (`always` / `conditional` / `independent`); pairs absent from the map are `independent` (never suppress) |
 | Decision | `TAMPERING_LOW_LIGHT_AREA_SLACK` | 0.20 | Slack for the tampering→low_light area-conservation predicate (extent mismatch tolerated between obstruction area and dark region) |
 | Decision | `TAMPERING_BLUR_AREA_SLACK` | 0.20 | Slack for the tampering→blur area-conservation predicate (extent mismatch tolerated between obstruction area and lost-sharpness area) |

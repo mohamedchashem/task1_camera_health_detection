@@ -29,10 +29,12 @@ from pipeline.decision_engine import (
     EVENT_STATUS_CONFIRMED,
     TEMPORAL_STATUS_CONFIRMED,
     TEMPORAL_STATUS_PENDING,
+    CandidateClassification,
     ConfirmationTracker,
     DecisionEngine,
     DetectorObservation,
     Fault,
+    classify_candidates,
     fuse_observations,
     resolve_primary_fault,
     split_candidates_for_primary,
@@ -276,6 +278,8 @@ def test_suppression_still_works() -> None:
     assert result.primary_fault == "tampering"
     assert all(fault.fault_type != "low_light" for fault in result.faults)
     assert result.suppressed_faults == ("low_light",)
+    # Causally-suppressed (floor-clearing) candidates are NOT below-floor.
+    assert result.below_floor_faults == ()
 
 
 def test_multi_fault_independent() -> None:
@@ -438,6 +442,79 @@ def test_low_light_suppresses_blur_when_near_black() -> None:
     result = engine.process_frame(_frame(), 0, 0.0)
     assert [fault.fault_type for fault in result.faults] == ["low_light"]
     assert result.suppressed_faults == ("blur",)
+
+
+# --- classify_candidates (Part B: suppressed vs below-floor split) ---------
+
+
+def _candidate(
+    detector: str,
+    confidence: float,
+    **metrics: float,
+) -> DetectorObservation:
+    """Candidate observation carrying raw metrics for conditional predicates."""
+    return DetectorObservation(
+        detector, DETECTOR_STATUS_OK, True, confidence, metrics=dict(metrics)
+    )
+
+
+def test_classify_candidates_below_floor_only() -> None:
+    # A candidate below its own emission floor never had a chance to be
+    # suppressed -- it lands in below_floor, never in suppressed.
+    candidates = {"low_light": _candidate("low_light", confidence=0.2)}
+    result = classify_candidates(candidates)
+    assert result.survivors == frozenset()
+    assert result.below_floor == frozenset({"low_light"})
+    assert result.suppressed == frozenset()
+
+
+def test_classify_candidates_causally_suppressed_only() -> None:
+    # tilt (survivor) suppresses blur via the "always" relation: blur clears
+    # its own floor but is removed by a surviving higher-precedence fault --
+    # real causal suppression only, not a below-floor candidate.
+    candidates = {
+        "tilt": _candidate("tilt", confidence=0.8),
+        "blur": _candidate("blur", confidence=0.6),
+    }
+    result = classify_candidates(candidates)
+    assert result.survivors == frozenset({"tilt"})
+    assert result.below_floor == frozenset()
+    assert result.suppressed == frozenset({"blur"})
+
+
+def test_classify_candidates_both_buckets() -> None:
+    # tampering (survivor) suppresses low_light through the conditional
+    # area-conservation predicate, while tilt is simply too weak (below its
+    # own floor). Both non-survivor kinds are present and stay separate.
+    candidates = {
+        "tampering": _candidate("tampering", confidence=0.85, total_loss_fraction=0.9),
+        "low_light": _candidate("low_light", confidence=0.75, relative_increase=0.3),
+        "tilt": _candidate("tilt", confidence=0.2),
+    }
+    result = classify_candidates(candidates)
+    assert result.survivors == frozenset({"tampering"})
+    assert result.below_floor == frozenset({"tilt"})
+    assert result.suppressed == frozenset({"low_light"})
+
+
+def test_classify_candidates_clean_survivor() -> None:
+    # A single candidate at or above its own floor with no suppressor:
+    # survivor only -- neither below-floor nor suppressed.
+    candidates = {"tampering": _candidate("tampering", confidence=0.85)}
+    result = classify_candidates(candidates)
+    assert result.survivors == frozenset({"tampering"})
+    assert result.below_floor == frozenset()
+    assert result.suppressed == frozenset()
+
+
+def test_classify_candidates_empty_candidates() -> None:
+    # No candidates: every bucket is empty and the buckets stay disjoint.
+    result = classify_candidates({})
+    assert result == CandidateClassification(
+        survivors=frozenset(),
+        below_floor=frozenset(),
+        suppressed=frozenset(),
+    )
 
 
 # --- 2. Confidence gating --------------------------------------------------
@@ -653,7 +730,13 @@ def test_engine_emission_floor_prevents_weak_candidate_event() -> None:
         "cam1",
         {"tampering": _Detector(result=_Result(is_candidate=True, confidence=0.2))},
     )
-    for frame_number, t in [(0, 0.0), (1, 1.0), (2, 2.0)]:
+    # A sub-floor candidate is bucketed as below_floor_faults (never
+    # suppressed_faults) and never logs.
+    result = engine.process_frame(_frame(), 0, 0.0)
+    assert result.faults == ()
+    assert result.suppressed_faults == ()
+    assert result.below_floor_faults == ("tampering",)
+    for frame_number, t in [(1, 1.0), (2, 2.0)]:
         engine.process_frame(_frame(), frame_number, t)
     assert engine.drain_events() == []
 
@@ -806,7 +889,127 @@ def test_faults_confirm_independently() -> None:
     assert status["blur"] == TEMPORAL_STATUS_PENDING
 
 
+def test_confirmed_peaks_empty_when_nothing_confirmed() -> None:
+    tracker = _make_tracker()
+    assert tracker.confirmed_peaks() == {}
+
+    # A pending (observed but not yet confirmed) fault is not reported.
+    _feed(tracker, [(0, 0.0, True), (1, 1.0, True)])
+    assert tracker.confirmed_peaks() == {}
+
+
+def test_confirmed_peaks_single_confirmed_fault() -> None:
+    tracker = _make_tracker()
+    _feed(tracker, [(0, 0.0, True), (1, 1.0, True), (2, 2.0, True)])
+    assert tracker.confirmed_peaks() == {"low_light": 0.7}
+
+    # The reported value is the tracker's running peak over the episode: a
+    # stronger candidate while confirmed raises it, a weaker one does not.
+    tracker.update({"low_light": 0.9}, ["low_light"], 3, 3.0)
+    assert tracker.confirmed_peaks() == {"low_light": 0.9}
+    tracker.update({"low_light": 0.6}, ["low_light"], 4, 4.0)
+    assert tracker.confirmed_peaks() == {"low_light": 0.9}
+
+
+def test_confirmed_peaks_multiple_faults_overlapping_windows() -> None:
+    # cam_05 scenario: two faults' confirmed windows overlap in time. Both
+    # must be reported simultaneously, each with its own peak confidence.
+    tracker = _make_tracker()
+    for frame_number, t in [(0, 0.0), (1, 1.0), (2, 2.0)]:
+        tracker.update(
+            {"low_light": 0.7, "blur": 0.8},
+            ["low_light", "blur"],
+            frame_number,
+            t,
+        )
+    assert tracker.confirmed_peaks() == {"low_light": 0.7, "blur": 0.8}
+
+    # The overlap persists while both faults are still observed...
+    tracker.update({"low_light": 0.7, "blur": 0.8}, ["low_light", "blur"], 3, 3.0)
+    assert tracker.confirmed_peaks() == {"low_light": 0.7, "blur": 0.8}
+
+    # ...and when low_light's window ages out, only low_light clears.
+    for frame_number, t in [(4, 4.0), (5, 5.0)]:
+        tracker.update({"blur": 0.8}, ["blur"], frame_number, t)
+    assert tracker.confirmed_peaks() == {"blur": 0.8}
+
+
+def test_engine_frame_exposes_confirmed_faults() -> None:
+    # Two faults confirmed on the same frames: process_frame must surface
+    # BOTH in confirmed_faults (DECISION_PRECEDENCE order) with their peak
+    # confidences. Low-light stays below its 0.8 gate floor so tampering is
+    # never execution-gated out.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "tampering": _Detector(result=_Result(is_candidate=True, confidence=0.7)),
+            "low_light": _Detector(result=_Result(is_candidate=True, confidence=0.75)),
+        },
+    )
+    # Nothing confirmed yet on the first frame.
+    assert engine.process_frame(_frame(), 0, 0.0).confirmed_faults == ()
+    engine.process_frame(_frame(), 1, 1.0)
+    # After the third observed frame both faults confirm together.
+    assert engine.process_frame(_frame(), 2, 2.0).confirmed_faults == (
+        Fault(fault_type="tampering", confidence=0.7),
+        Fault(fault_type="low_light", confidence=0.75),
+    )
+    result = engine.process_frame(_frame(), 3, 3.0)
+    assert result.confirmed_faults == (
+        Fault(fault_type="tampering", confidence=0.7),
+        Fault(fault_type="low_light", confidence=0.75),
+    )
+
+    # confirmed_faults is the temporal truth, not this frame's survivors:
+    # when tampering's detector stops flagging a candidate, it still stays
+    # listed because it remains temporally confirmed.
+    engine._detectors["tampering"] = _Detector(result=_Result(is_candidate=False))
+    frame4 = engine.process_frame(_frame(), 4, 4.0)
+    assert [fault.fault_type for fault in frame4.faults] == ["low_light"]
+    assert frame4.confirmed_faults == (
+        Fault(fault_type="tampering", confidence=0.7),
+        Fault(fault_type="low_light", confidence=0.75),
+    )
+
+
 # --- 4. Fault isolation ------------------------------------------------------
+
+
+def test_non_candidate_observation_zeroes_reported_confidence() -> None:
+    # Regression: a detector can emit a high normalized confidence while
+    # declaring is_candidate=False (observed: tampering confidence 1.0 with
+    # is_candidate False when blur coexistence pushed total_loss_fraction
+    # over its ceiling). _run_detector must package this honestly: the
+    # reportable confidence is zeroed while raw_confidence preserves the
+    # original value for debugging.
+    engine = DecisionEngine(
+        "cam1",
+        {"tampering": _Detector(result=_Result(is_candidate=False, confidence=1.0))},
+    )
+    result = engine.process_frame(_frame(), 0, 0.0)
+    obs = result.detectors[0]
+    assert obs.status == DETECTOR_STATUS_OK
+    assert obs.is_candidate is False
+    assert obs.confidence == 0.0
+    assert obs.raw_confidence == pytest.approx(1.0)
+    # The non-candidate stays out of every decision path regardless.
+    assert result.faults == ()
+    assert result.primary_fault is None
+
+
+def test_candidate_observation_keeps_confidence_unchanged() -> None:
+    # Normal case: a real candidate's reportable confidence equals its raw
+    # value -- zeroing applies only to non-candidates.
+    engine = DecisionEngine(
+        "cam1",
+        {"blur": _Detector(result=_Result(is_candidate=True, confidence=0.8))},
+    )
+    result = engine.process_frame(_frame(), 0, 0.0)
+    obs = result.detectors[0]
+    assert obs.status == DETECTOR_STATUS_OK
+    assert obs.is_candidate is True
+    assert obs.confidence == pytest.approx(0.8)
+    assert obs.raw_confidence == pytest.approx(0.8)
 
 
 def test_detector_exception_does_not_crash_fusion() -> None:

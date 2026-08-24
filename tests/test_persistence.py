@@ -64,6 +64,9 @@ def _decision_frame(
     secondary: tuple[str, ...] = (),
     suppressed: tuple[str, ...] = (),
     faults: tuple[Fault, ...] = (),
+    below_floor: tuple[str, ...] = (),
+    confirmed: tuple[Fault, ...] = (),
+    raw_confidence: float | None = None,
 ) -> DecisionFrame:
     observations = [DetectorObservation("low_light", DETECTOR_STATUS_OK, False, 0.1)]
     if error_detector:
@@ -78,6 +81,10 @@ def _decision_frame(
         DetectorObservation(
             "blur", DETECTOR_STATUS_OK, primary == "blur",
             0.8 if primary == "blur" else 0.1,
+            raw_confidence=(
+                raw_confidence if raw_confidence is not None
+                else (0.8 if primary == "blur" else 0.1)
+            ),
         )
     )
     return DecisionFrame(
@@ -91,6 +98,8 @@ def _decision_frame(
         temporal_confirmation_status={"blur": "confirmed"} if primary == "blur" else {},
         detectors=tuple(observations),
         faults=faults,
+        below_floor_faults=below_floor,
+        confirmed_faults=confirmed,
     )
 
 
@@ -213,14 +222,18 @@ def test_frame_logger_writes_valid_jsonl(tmp_path: Path) -> None:
     lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(lines) == 1
     record = json.loads(lines[0])
-    assert record["schema_version"] == 2
+    assert record["schema_version"] == 3
     assert record["camera_id"] == "cam1"
     assert record["frame_number"] == 1
     assert record["primary_fault"] == "blur"
     assert record["faults"] == []  # schema v2: no active faults on this frame
+    assert record["below_floor_faults"] == []  # schema v3: no sub-floor candidates
+    assert record["confirmed_faults"] == []  # schema v3: nothing temporally confirmed
     assert record["confidence"] == pytest.approx(0.8)
     assert record["latency_ms"] == pytest.approx(3.5)
     assert record["detectors"]["blur"]["is_candidate"] is True
+    # schema v3: every detector entry carries raw_confidence alongside confidence.
+    assert record["detectors"]["blur"]["raw_confidence"] == pytest.approx(0.8)
 
 
 def test_frame_logger_serializes_multi_fault_view(tmp_path: Path) -> None:
@@ -244,16 +257,64 @@ def test_frame_logger_serializes_multi_fault_view(tmp_path: Path) -> None:
     record = json.loads(
         [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()][0]
     )
+    assert record["schema_version"] == 3
     assert record["primary_fault"] == "tampering"
     assert record["confidence"] == pytest.approx(0.8)
     assert record["secondary_symptoms"] == ["blur"]
     assert record["suppressed_faults"] == ["low_light"]
+    assert record["below_floor_faults"] == []  # schema v3
+    assert record["confirmed_faults"] == []  # schema v3
     # Each surviving fault is serialized with fault_type + confidence, in
     # DECISION_PRECEDENCE order (tampering ranks above blur).
     assert record["faults"] == [
         {"fault_type": "tampering", "confidence": pytest.approx(0.85)},
         {"fault_type": "blur", "confidence": pytest.approx(0.62)},
     ]
+
+
+def test_frame_logger_serializes_banner_fix_fields(tmp_path: Path) -> None:
+    # Schema v3: below_floor_faults and confirmed_faults join the record, and
+    # every detector entry carries raw_confidence alongside confidence. The
+    # non-candidate blur observation keeps the Part C regression shape: a
+    # detector's reportable confidence is zeroed/depressed on non-candidates
+    # while raw_confidence preserves the original value.
+    path = tmp_path / "frame_log.jsonl"
+    logger = FrameLogger(path, interval_frames=1, flush_interval_frames=1, retention_days=7)
+    logger.open()
+    logger.write_frame(
+        _decision_frame(
+            4,
+            primary="tampering",
+            suppressed=("low_light",),
+            faults=(Fault("tampering", 0.85),),
+            below_floor=("blur",),
+            confirmed=(Fault("tampering", 0.9), Fault("blur", 0.7)),
+            raw_confidence=1.0,
+        )
+    )
+    logger.close()
+
+    record = json.loads(
+        [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()][0]
+    )
+    assert record["schema_version"] == 3
+    # below_floor_faults: plain fault-type strings (same convention as
+    # suppressed_faults), not objects.
+    assert record["below_floor_faults"] == ["blur"]
+    # confirmed_faults: the same {fault_type, confidence} object shape as the
+    # existing `faults` key, but sourced from the temporal truth (peak
+    # confidence), in DECISION_PRECEDENCE order.
+    assert record["confirmed_faults"] == [
+        {"fault_type": "tampering", "confidence": pytest.approx(0.9)},
+        {"fault_type": "blur", "confidence": pytest.approx(0.7)},
+    ]
+    # suppressed_faults serializes the causally-suppressed-only value.
+    assert record["suppressed_faults"] == ["low_light"]
+    # The non-candidate blur detector: raw_confidence (1.0) != confidence (0.1).
+    blur = record["detectors"]["blur"]
+    assert blur["is_candidate"] is False
+    assert blur["confidence"] == pytest.approx(0.1)
+    assert blur["raw_confidence"] == pytest.approx(1.0)
 
 
 def test_frame_logger_sampling_logs_only_interval_frames(tmp_path: Path) -> None:
@@ -441,6 +502,284 @@ def test_annotate_frame_stacks_four_faults_within_frame() -> None:
     assert frame.sum() == 0            # the input frame is untouched
     assert annotated[:210].sum() > 0   # labels were drawn in the top band
     assert annotated[210:].sum() == 0  # and none ran off the bottom of the frame
+
+
+# --- banner-fix (Part A): new five-section banner (isolated, synthetic) -----
+
+
+def test_banner_confirmed_and_pending_overlap() -> None:
+    # A fault confirmed in the tracker shares the frame with a pending
+    # (not-yet-confirmed) fusion survivor: confirmed renders as a FAULT
+    # line, the pending survivor renders as a "pending:" line.
+    lines = build_annotation_lines(
+        None,
+        0.0,
+        confirmed_faults=(Fault("blur", 0.80),),
+        pending_faults=(Fault("tampering", 0.70),),
+        video_time_s=1.5,
+    )
+    assert lines == [
+        "FAULT: blur (conf=0.80)",
+        "pending: tampering (conf=0.70)",
+        "t=1.50s",
+    ]
+
+
+def test_banner_gate_skip_transparency() -> None:
+    # Near-black frame: low_light is confirmed while tampering and tilt are
+    # gate-skipped (their output is unmeasurable this frame). Both are
+    # listed explicitly in the "unmeasurable:" section.
+    lines = build_annotation_lines(
+        None,
+        0.0,
+        confirmed_faults=(Fault("low_light", 0.90),),
+        unmeasurable_faults=("tampering", "tilt"),
+        video_time_s=2.0,
+    )
+    assert lines == [
+        "FAULT: low_light (conf=0.90)",
+        "unmeasurable: tampering, tilt",
+        "t=2.00s",
+    ]
+
+
+def test_banner_causal_suppression() -> None:
+    # tampering's physical cause explains low_light on this frame: low_light
+    # is causally suppressed (not confirmed, not "too weak").
+    lines = build_annotation_lines(
+        None,
+        0.0,
+        confirmed_faults=(Fault("tampering", 0.85),),
+        suppressed_faults=("low_light",),
+        video_time_s=3.0,
+    )
+    assert lines == [
+        "FAULT: tampering (conf=0.85)",
+        "suppressed: low_light",
+        "t=3.00s",
+    ]
+
+
+def test_banner_contradiction_resolved_case() -> None:
+    # Regression scenario from Part C: tampering reported confidence 1.0
+    # with is_candidate=False (blur coexistence pushed total_loss_fraction
+    # over its ceiling). After the raw_confidence fix its reportable
+    # confidence is 0.0 -- below its floor -- so the banner honestly renders
+    # "too weak:" instead of a misleading high-confidence FAULT line.
+    lines = build_annotation_lines(
+        None,
+        0.0,
+        confirmed_faults=(Fault("blur", 0.80),),
+        below_floor_faults=("tampering",),
+        video_time_s=4.5,
+    )
+    assert lines == [
+        "FAULT: blur (conf=0.80)",
+        "too weak: tampering",
+        "t=4.50s",
+    ]
+
+
+def test_banner_too_weak_case() -> None:
+    # Below-floor noise renders as "too weak:", never as "suppressed:".
+    lines = build_annotation_lines(
+        None,
+        0.0,
+        confirmed_faults=(Fault("tampering", 0.85),),
+        below_floor_faults=("low_light", "tilt"),
+        video_time_s=5.0,
+    )
+    assert lines == [
+        "FAULT: tampering (conf=0.85)",
+        "too weak: low_light, tilt",
+        "t=5.00s",
+    ]
+
+
+def test_banner_pending_case() -> None:
+    # Nothing confirmed yet: only pending survivors render, in precedence
+    # order, each with its frame confidence.
+    lines = build_annotation_lines(
+        None,
+        0.0,
+        pending_faults=(Fault("low_light", 0.70), Fault("blur", 0.60)),
+        video_time_s=1.0,
+    )
+    assert lines == [
+        "pending: low_light (conf=0.70)",
+        "pending: blur (conf=0.60)",
+        "t=1.00s",
+    ]
+
+
+def test_banner_confirmed_with_gate_skip_marker() -> None:
+    # tilt is BOTH confirmed and gate-skipped this exact frame: its FAULT
+    # line carries the [unmeasurable] marker and it is NOT repeated in the
+    # unmeasurable section. blur is gate-skipped but not confirmed -> listed.
+    lines = build_annotation_lines(
+        None,
+        0.0,
+        confirmed_faults=(Fault("tilt", 0.65),),
+        unmeasurable_faults=("tilt", "blur"),
+        video_time_s=4.0,
+    )
+    assert lines == [
+        "FAULT: tilt (conf=0.65) [unmeasurable]",
+        "unmeasurable: blur",
+        "t=4.00s",
+    ]
+
+
+def test_annotate_frame_draws_banner_fix_sections() -> None:
+    # The banner-fix inputs flow through annotate_frame's drawing loop and
+    # the input frame stays untouched.
+    frame = np.zeros((160, 320, 3), dtype=np.uint8)
+    annotated = annotate_frame(
+        frame,
+        None,
+        0.0,
+        confirmed_faults=(Fault("tampering", 0.85),),
+        pending_faults=(Fault("low_light", 0.70),),
+        below_floor_faults=("tilt",),
+        unmeasurable_faults=("blur",),
+        video_time_s=1.5,
+    )
+    assert annotated.shape == frame.shape
+    assert annotated.dtype == frame.dtype
+    assert annotated.sum() > 0  # text was actually drawn
+    assert frame.sum() == 0     # the input frame is untouched
+
+
+def test_banner_exclusivity_invariant_via_priority_resolution(caplog) -> None:
+    # Hard requirement: a fault type appears in exactly ONE of the five
+    # banner sections. Passing a fault in several lists is a caller error
+    # resolved by priority order (confirmed > pending > suppressed > too
+    # weak > unmeasurable), with a warning logged per dropped duplicate.
+    caplog.set_level("WARNING")
+    lines = build_annotation_lines(
+        None,
+        0.0,
+        confirmed_faults=(Fault("blur", 0.80),),
+        pending_faults=(Fault("blur", 0.60), Fault("tampering", 0.70)),
+        suppressed_faults=("tampering",),
+        below_floor_faults=("low_light", "tampering"),
+        unmeasurable_faults=("low_light", "tilt"),
+        video_time_s=1.5,
+    )
+    assert lines == [
+        "FAULT: blur (conf=0.80)",
+        "pending: tampering (conf=0.70)",
+        "too weak: low_light",
+        "unmeasurable: tilt",
+        "t=1.50s",
+    ]
+    # Every rendered fault appears in exactly one section.
+    rendered = "\n".join(lines)
+    for fault in ("blur", "tampering", "low_light", "tilt"):
+        assert rendered.count(fault) == 1, fault
+    # Each duplicate drop emitted a warning (blur->pending, tampering->
+    # suppressed, tampering->too weak, low_light->unmeasurable).
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 4
+
+
+def test_banner_section_ordering_follows_precedence() -> None:
+    # Ordering within every section is DECISION_PRECEDENCE, independent of
+    # the input order. Each case below uses an out-of-precedence input order
+    # and at least one new param so the banner-fix path is active.
+    t = 1.0
+    assert build_annotation_lines(
+        None, 0.0,
+        confirmed_faults=(Fault("blur", 0.60), Fault("tampering", 0.85)),
+        video_time_s=t,
+    ) == [
+        "FAULT: tampering (conf=0.85)",
+        "FAULT: blur (conf=0.60)",
+        "t=1.00s",
+    ]
+    assert build_annotation_lines(
+        None, 0.0,
+        pending_faults=(Fault("blur", 0.60), Fault("low_light", 0.70)),
+        video_time_s=t,
+    ) == [
+        "pending: low_light (conf=0.70)",
+        "pending: blur (conf=0.60)",
+        "t=1.00s",
+    ]
+    assert build_annotation_lines(
+        None, 0.0,
+        suppressed_faults=("tilt", "tampering"),
+        unmeasurable_faults=("blur",),
+        video_time_s=t,
+    ) == [
+        "suppressed: tampering, tilt",
+        "unmeasurable: blur",
+        "t=1.00s",
+    ]
+    assert build_annotation_lines(
+        None, 0.0,
+        below_floor_faults=("tilt", "tampering"),
+        unmeasurable_faults=("blur",),
+        video_time_s=t,
+    ) == [
+        "too weak: tampering, tilt",
+        "unmeasurable: blur",
+        "t=1.00s",
+    ]
+    assert build_annotation_lines(
+        None, 0.0,
+        unmeasurable_faults=("blur", "tampering"),
+        video_time_s=t,
+    ) == [
+        "unmeasurable: tampering, blur",
+        "t=1.00s",
+    ]
+
+
+def test_banner_legacy_fallback_when_new_params_empty() -> None:
+    # With all four banner-fix inputs empty the legacy rendering is
+    # byte-for-byte unchanged: active-fault stack, suppressed summary,
+    # timestamp.
+    faults = (Fault("tampering", 0.85), Fault("blur", 0.62))
+    lines = build_annotation_lines(
+        "tampering",
+        0.85,
+        faults=faults,
+        secondary_symptoms=("blur",),
+        suppressed_faults=("low_light",),
+        video_time_s=1.5,
+        confirmed_faults=(),
+        pending_faults=(),
+        below_floor_faults=(),
+        unmeasurable_faults=(),
+    )
+    assert lines == [
+        "FAULT: tampering (conf=0.85)",
+        "FAULT: blur (conf=0.62)",
+        "suppressed: low_light",
+        "t=1.50s",
+    ]
+
+
+def test_banner_legacy_fallback_single_fault_when_new_params_empty() -> None:
+    # Single-fault legacy fallback (primary_fault path) is also unchanged.
+    lines = build_annotation_lines(
+        "tampering",
+        0.6,
+        secondary_symptoms=("low_light",),
+        suppressed_faults=("blur",),
+        video_time_s=1.5,
+        confirmed_faults=(),
+        pending_faults=(),
+        below_floor_faults=(),
+        unmeasurable_faults=(),
+    )
+    assert lines == [
+        "FAULT: tampering (conf=0.60)",
+        "secondary: low_light",
+        "suppressed: blur",
+        "t=1.50s",
+    ]
 
 
 def test_save_annotated_frame_writes_snapshot(tmp_path: Path) -> None:

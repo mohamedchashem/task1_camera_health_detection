@@ -55,7 +55,6 @@ from pipeline.decision_engine import (
     ConfirmedFault,
     DecisionEngine,
     DecisionFrame,
-    split_candidates_for_primary,
 )
 from pipeline.event_store import EventStore
 from pipeline.file_reader import read_frames_from_file
@@ -786,26 +785,44 @@ class CameraWorker(threading.Thread):
     def _save_annotated_frame(
         self, event: ConfirmedFault, decision: DecisionFrame, frame: np.ndarray
     ) -> None:
-        # Multiple detectors can confirm on the same frame. The banner must
-        # describe the event being written (event.fault_type), not the frame's
-        # fused primary, which is shared by every event of that frame.
-        candidates = [
+        # Banner-fix (Part D+E wiring): source every banner section from the
+        # DecisionFrame fields the engine already produces instead of a
+        # per-event re-partition of this frame's candidates. A confirmation
+        # can legitimately fire on a frame with zero current candidates (the
+        # fault confirmed via its trailing 3-second window, not this exact
+        # frame -- the cam_05 tilt case), so there is deliberately no
+        # candidate-based early return here: confirmed_faults is the temporal
+        # truth and a confirmed event always has at least one entry in it.
+        confirmed_faults = decision.confirmed_faults
+        confirmed_types = {fault.fault_type for fault in confirmed_faults}
+        # Current-frame survivors that are not yet confirmed use their frame
+        # confidence; confirmed faults use their peak confidence instead.
+        pending_faults = tuple(
+            fault
+            for fault in decision.faults
+            if fault.fault_type not in confirmed_types
+        )
+        # Gate-skipped detectors this frame (status "skipped", reason
+        # "suppressed_by_gate"). Passed in FULL -- including fault types that
+        # are also confirmed -- annotate.py's exclusivity logic renders the
+        # overlap as a [unmeasurable] marker on the confirmed FAULT line.
+        unmeasurable_faults = tuple(
             obs.detector
             for obs in decision.detectors
-            if obs.status == DETECTOR_STATUS_OK and obs.is_candidate
-        ]
-        secondary, suppressed = split_candidates_for_primary(event.fault_type, candidates)
+            if obs.status == DETECTOR_STATUS_SKIPPED
+            and obs.reason == "suppressed_by_gate"
+        )
         annotated = annotate_frame(
             frame,
             event.fault_type,
             event.peak_confidence,
-            secondary_symptoms=secondary,
-            suppressed_faults=suppressed,
+            suppressed_faults=decision.suppressed_faults,
             video_time_s=decision.video_time_s,
-            # Multi-label: render every active fault on this frame stacked
-            # vertically (each with its own confidence); the event's own
-            # fault is one of them.
             faults=decision.faults,
+            confirmed_faults=confirmed_faults,
+            pending_faults=pending_faults,
+            below_floor_faults=decision.below_floor_faults,
+            unmeasurable_faults=unmeasurable_faults,
         )
         save_annotated_frame(
             annotated,

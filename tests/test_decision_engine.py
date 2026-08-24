@@ -32,6 +32,7 @@ from pipeline.decision_engine import (
     ConfirmationTracker,
     DecisionEngine,
     DetectorObservation,
+    Fault,
     fuse_observations,
     resolve_primary_fault,
     split_candidates_for_primary,
@@ -228,6 +229,64 @@ def test_split_candidates_for_primary_partitions_around_fixed_primary() -> None:
     secondary, suppressed = split_candidates_for_primary("low_light", candidates)
     assert secondary == ("tampering",)
     assert suppressed == ("tilt", "blur")
+
+# --- Multi-label fusion (Phase 1) ------------------------------------------
+
+
+def test_single_fault_no_regression() -> None:
+    # Single-fault frames must produce identical engine output to the V1
+    # engine: exactly one survivor, same primary/confidence/symptoms.
+    engine = DecisionEngine(
+        "cam1",
+        {"tampering": _Detector(result=_Result(is_candidate=True, confidence=0.85))},
+    )
+    result = engine.process_frame(_frame(), 0, 0.0)
+    assert result.faults == (Fault(fault_type="tampering", confidence=0.85),)
+    assert result.primary_fault == "tampering"
+    assert result.confidence == pytest.approx(0.85)
+    assert result.secondary_symptoms == ()
+    assert result.suppressed_faults == ()
+    assert engine.drain_events() == []  # single frame: temporal still pending
+
+
+def test_suppression_still_works() -> None:
+    # tampering causally explains low_light (DECISION_SUPPRESSION_MAP) and
+    # clears the relative margin (0.85 * MARGIN >= 0.75): low_light must be
+    # removed from the survivor list, exactly as V1 suppressed it.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "tampering": _Detector(result=_Result(is_candidate=True, confidence=0.85)),
+            "low_light": _Detector(result=_Result(is_candidate=True, confidence=0.75)),
+        },
+    )
+    result = engine.process_frame(_frame(), 0, 0.0)
+    assert result.faults == (Fault(fault_type="tampering", confidence=0.85),)
+    assert result.primary_fault == "tampering"
+    assert all(fault.fault_type != "low_light" for fault in result.faults)
+    assert result.suppressed_faults == ("low_light",)
+
+
+def test_multi_fault_independent() -> None:
+    # Multi-label happy path. DECISION_SUPPRESSION_MAP causally explains
+    # every fault pair, so two faults can coexist only when an active
+    # suppressor fails the relative margin against a stronger signal:
+    # tampering 0.5 * DECISION_SUPPRESSION_MARGIN (0.75) < tilt 0.9, so tilt
+    # is NOT suppressed and both faults are reported in precedence order.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "tampering": _Detector(result=_Result(is_candidate=True, confidence=0.5)),
+            "tilt": _Detector(result=_Result(is_candidate=True, confidence=0.9)),
+        },
+    )
+    result = engine.process_frame(_frame(), 0, 0.0)
+    assert result.faults == (
+        Fault(fault_type="tampering", confidence=0.5),
+        Fault(fault_type="tilt", confidence=0.9),
+    )
+    assert result.primary_fault == "tampering"
+    assert {fault.fault_type for fault in result.faults} == {"tampering", "tilt"}
 
 # --- 2. Confidence gating --------------------------------------------------
 

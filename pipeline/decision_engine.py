@@ -11,19 +11,19 @@ Fault isolation guarantee: a detector that raises is contained per frame
 after repeated consecutive errors a detector is temporarily skipped
 (backoff), then retried automatically.
 
-Fusion contract (approved Phase 1 spec, revised for false-positive control):
-- candidates are ranked by ``DECISION_PRECEDENCE`` (higher severity
-  first; confidence breaks only ties);
-- the primary is the highest-ranked candidate not suppressed by a
-  higher-ranked *active* suppressor (confidence >=
-  ``DECISION_SUPPRESSOR_MIN_CONFIDENCE`` AND relative margin
-  ``suppressor * DECISION_SUPPRESSION_MARGIN >= suppressed``);
-- an active candidate beats a below-gate candidate of lower precedence;
-  if no candidate is active, the top-ranked candidate still becomes
-  primary (documented limitation of the V1 rules);
-- ``suppressed_faults`` are the remaining candidates the primary's
-  signal explains (``DECISION_SUPPRESSION_MAP``); everything else is a
-  ``secondary_symptom``.
+Fusion contract (multi-label revision, Phase 1):
+- per-frame candidates are filtered to those reaching their per-fault
+  emission floor (``DECISION_CONFIRM_MIN_CONFIDENCE``);
+- a candidate is removed when a *surviving* higher-precedence active
+  suppressor (confidence >= ``DECISION_SUPPRESSOR_MIN_CONFIDENCE`` AND
+  relative margin ``suppressor * DECISION_SUPPRESSION_MARGIN >=
+  suppressed``) lists it in ``DECISION_SUPPRESSION_MAP``;
+- survivors become ``DecisionFrame.faults`` in ``DECISION_PRECEDENCE``
+  order; ``primary_fault`` is the top-ranking survivor (backward
+  compatible), the remaining survivors are ``secondary_symptoms``, and
+  removed candidates are ``suppressed_faults``;
+- the V1 single-primary rules remain available as
+  ``resolve_primary_fault`` / ``fuse_observations`` (unchanged behavior).
 
 Execution gating: detectors run in ``DECISION_EXECUTION_ORDER`` (cheap
 signal detectors first, expensive structural last). A gate detector that
@@ -117,6 +117,18 @@ class DetectorObservation:
 
 
 @dataclass(frozen=True)
+class Fault:
+    """A fault that survives per-frame multi-label fusion.
+
+    ``fault_type`` is a name in ``DECISION_PRECEDENCE``; ``confidence`` is
+    the detector's normalized confidence for that fault on this frame.
+    """
+
+    fault_type: str
+    confidence: float
+
+
+@dataclass(frozen=True)
 class DecisionFrame:
     """Per-frame fused decision for one camera."""
 
@@ -129,6 +141,10 @@ class DecisionFrame:
     suppressed_faults: tuple[str, ...]
     temporal_confirmation_status: dict[str, str]
     detectors: tuple[DetectorObservation, ...]
+    # Multi-label survivors in DECISION_PRECEDENCE order. The default keeps
+    # callers that construct a frame from persisted data working; the engine
+    # always populates this field.
+    faults: tuple[Fault, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -232,6 +248,47 @@ def resolve_primary_fault(
 
     secondary, suppressed = split_candidates_for_primary(primary, ranked)
     return primary, secondary, suppressed
+
+
+def resolve_active_faults(candidates: Mapping[str, float]) -> tuple[Fault, ...]:
+    """Resolve the multi-label fault list for one frame.
+
+    Args:
+        candidates: mapping fault_type -> confidence, for faults flagged as
+            candidates by their detector this frame (status ``ok``). Fault
+            names must be in ``DECISION_PRECEDENCE``.
+
+    Returns:
+        A tuple of ``Fault`` survivors in ``DECISION_PRECEDENCE`` order. A
+        candidate survives when:
+        - its confidence reaches the fault's per-fault emission floor in
+          ``DECISION_CONFIRM_MIN_CONFIDENCE``; and
+        - no *surviving* higher-precedence candidate actively suppresses it
+          (suppressor confidence >= ``DECISION_SUPPRESSOR_MIN_CONFIDENCE``,
+          the relative margin ``suppressor * DECISION_SUPPRESSION_MARGIN >=
+          suppressed`` clears via ``_margin_met``, and it is listed in
+          ``DECISION_SUPPRESSION_MAP``).
+
+        A suppressed candidate never acts as a suppressor itself, so only
+        higher-precedence survivors can remove lower-precedence candidates.
+        Output is deterministic: candidates are visited in precedence order
+        and survivors keep that order.
+    """
+    ranked = sorted(candidates, key=lambda fault: _FAULT_RANK[fault])
+    survivors: list[Fault] = []
+    for fault in ranked:
+        confidence = candidates[fault]
+        if confidence < DECISION_CONFIRM_MIN_CONFIDENCE.get(fault, 0.0):
+            continue
+        if any(
+            candidates[s.fault_type] >= DECISION_SUPPRESSOR_MIN_CONFIDENCE
+            and _margin_met(candidates[s.fault_type], confidence)
+            and fault in DECISION_SUPPRESSION_MAP.get(s.fault_type, ())
+            for s in survivors
+        ):
+            continue
+        survivors.append(Fault(fault_type=fault, confidence=confidence))
+    return tuple(survivors)
 
 
 def fuse_observations(
@@ -534,27 +591,45 @@ class DecisionEngine:
             ):
                 active_gates[name] = obs.confidence
 
-        primary, secondary, suppressed, confidence = fuse_observations(observations)
-
         candidates = {
             obs.detector: obs.confidence
             for obs in observations
             if obs.status == DETECTOR_STATUS_OK and obs.is_candidate
         }
-        # A candidate suppressed by the precedence rules (its signal is
-        # explained by the primary's physical cause) is not independent
-        # evidence: it must not register as a positive sample in its own
-        # confirmation tracker for this frame.
-        candidates = {
-            fault: conf
-            for fault, conf in candidates.items()
-            if fault not in suppressed
+        # Multi-label fusion: survivors are the candidates that clear their
+        # per-fault emission floor (DECISION_CONFIRM_MIN_CONFIDENCE) and are
+        # not removed by a surviving higher-precedence active suppressor
+        # (DECISION_SUPPRESSION_MAP + relative margin).
+        faults = resolve_active_faults(candidates)
+        survivor_names = {fault.fault_type for fault in faults}
+
+        # A candidate removed by the precedence rules (its signal is explained
+        # by a surviving fault's physical cause) is not independent evidence:
+        # it must not register as a positive sample in its own confirmation
+        # tracker for this frame, so it can never confirm. Removed candidates
+        # (suppressed or below-floor) stay *observed*: they still count in the
+        # tracker's ratio denominator but never as positives.
+        tracker_candidates = {
+            fault.fault_type: fault.confidence for fault in faults
         }
         # Only OK observations count as observed: skipped detectors (disabled,
         # sub-sampled, or in backoff) must not dilute the confirmation ratio.
         observed = [obs.detector for obs in observations if obs.status == DETECTOR_STATUS_OK]
         self._pending_events.extend(
-            self._tracker.update(candidates, observed, frame_number, video_time_s)
+            self._tracker.update(tracker_candidates, observed, frame_number, video_time_s)
+        )
+
+        # Backward-compatible single-fault view of the multi-label result:
+        # primary is the top-ranking survivor; the remaining survivors are
+        # secondary symptoms; every candidate that did not survive fusion is
+        # a suppressed fault.
+        primary = faults[0].fault_type if faults else None
+        confidence = faults[0].confidence if faults else 0.0
+        secondary = tuple(fault.fault_type for fault in faults[1:])
+        suppressed = tuple(
+            fault
+            for fault in sorted(candidates, key=lambda name: _FAULT_RANK[name])
+            if fault not in survivor_names
         )
 
         return DecisionFrame(
@@ -567,6 +642,7 @@ class DecisionEngine:
             suppressed_faults=suppressed,
             temporal_confirmation_status=self._tracker.confirmation_status(),
             detectors=tuple(observations),
+            faults=faults,
         )
 
     def drain_events(self) -> list[ConfirmedFault]:

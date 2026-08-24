@@ -1,345 +1,257 @@
-# Camera Health Monitoring System
+# Real-Time Fault Detection Pipeline
 
 ## Table of Contents
 
-- [1. Project Overview & Architecture Summary](#1-project-overview--architecture-summary)
-- [2. System Requirements & Prerequisites](#2-system-requirements--prerequisites)
-- [3. Installation & Environment Setup](#3-installation--environment-setup)
-- [4. Execution Reference](#4-execution-reference)
+- [1. Architecture & Design Overview](#1-architecture--design-overview)
+- [2. System Requirements](#2-system-requirements)
+- [3. Installation & Setup](#3-installation--setup)
+- [4. Execution](#4-execution)
 - [5. Testing & Validation](#5-testing--validation)
 - [Appendix A: Repository Layout](#appendix-a-repository-layout)
 - [Appendix B: Configuration Reference](#appendix-b-configuration-reference)
-- [Appendix C: Detector Summary](#appendix-c-detector-summary)
-- [Appendix D: Production Readiness Status](#appendix-d-production-readiness-status)
+- [Appendix C: Detector Overview](#appendix-c-detector-overview)
+- [Appendix D: Validation Status](#appendix-d-validation-status)
 
 ---
 
-## 1. Project Overview & Architecture Summary
+## 1. Architecture & Design Overview
 
-The Camera Health Monitoring System is a real-time computer vision pipeline for continuous fault detection across one or more camera feeds. The system operates as a single process with per-camera worker threads, bounded memory consumption, and fail-fast startup validation.
+This is a real-time computer vision pipeline for continuous fault detection across one or more input streams. The system operates as a single orchestrator process with per-stream worker threads, bounded memory consumption, and fail-fast startup validation.
 
-Four independent detectors evaluate each incoming frame:
-
-- **Low-light detection** — identifies underexposed or degraded illumination conditions.
-- **Tampering / obstruction detection** — identifies physical interference with the camera's field of view.
-- **Blur / dirty-lens detection** — identifies loss of image sharpness consistent with lens contamination or defocus.
-- **Tilt detection** — identifies unauthorized changes in camera orientation.
-
-Detector outputs are fused by a per-camera `DecisionEngine`, which applies fault precedence rules, causal suppression logic, a spatial compactness guard (distinguishing genuine contiguous physical obstruction from scattered rotational edge-loss noise), and temporal confirmation before an event is considered confirmed. Confirmed fault episodes are persisted to a SQLite event store, alongside per-frame JSONL logs and periodic system metrics.
+Multiple independent detectors evaluate each incoming frame and emit candidate signals. A `DecisionEngine` fuses these signals per stream using precedence rules, causal suppression logic, spatial validation guards, and temporal confirmation before any event is considered confirmed. Confirmed events are persisted to a data store, alongside per-frame diagnostic logs and periodic system metrics.
 
 ### 1.1 Architectural Overview
 
 ```
-Camera 1 ─► Reader Sub-thread ─► Bounded Queue (FRAME_QUEUE_CAPACITY) ─► CameraWorker Thread ─► DecisionEngine
-Camera 2 ─► Reader Sub-thread ─► Bounded Queue ────────────────────────► CameraWorker Thread ─► DecisionEngine
-                                                                                    │
-                                                  Main Thread: Metrics Loop + Cooperative Shutdown
-                                                                                    ▼
-                                          EventStore (SQLite, WAL) · FrameLogger (JSONL) · Annotated Frame Ring
+Stream 1 ─► Reader Sub-thread ─► Bounded Queue ─► Worker Thread ─► DecisionEngine
+Stream 2 ─► Reader Sub-thread ─► Bounded Queue ──────────────────► Worker Thread ─► DecisionEngine
+                                                          │
+                                    Main Thread: Metrics Loop + Cooperative Shutdown
+                                                          ▼
+                                    Event Store · Diagnostic Logs · Annotated Snapshots
 ```
 
 ### 1.2 Concurrency Model
 
-- Each camera is managed by a dedicated `CameraWorker` thread (`main.py`). Each worker spawns a reader sub-thread that decodes frames into a bounded, per-camera queue (`queue.Queue(maxsize=FRAME_QUEUE_CAPACITY)`).
+- Each stream is managed by a dedicated `Worker` thread. Each worker spawns a reader sub-thread that decodes frames into a bounded, per-stream queue.
 - **Live stream sources** apply drop-oldest backpressure: when the queue is full, the oldest queued frame is evicted to admit the newest, bounding memory usage under sustained load.
-- **File-based sources** are lossless: the reader blocks for queue space rather than evicting frames, ensuring every frame of a local video file is processed exactly once.
-- Frames dequeued beyond `MAX_PROCESSING_LAG_SECONDS` after capture are discarded as stale.
-- The main thread runs a periodic metrics loop, writing per-camera counters to `system.jsonl`, and coordinates cooperative shutdown on `SIGINT`/`SIGTERM`, allowing workers to drain and flush within `SHUTDOWN_TIMEOUT_SECONDS`.
+- **File-based sources** are lossless: the reader blocks for queue space rather than evicting frames, ensuring every frame is processed exactly once.
+- Frames dequeued beyond a configurable max age are discarded as stale.
+- The main thread runs a periodic metrics loop and coordinates cooperative shutdown on system signals, allowing workers to drain and flush within a configurable timeout.
 
 ### 1.3 Decision Engine and Temporal Confirmation
 
-The `DecisionEngine` (`pipeline/decision_engine.py`) consolidates the four per-frame detector outputs into a single fused decision per camera:
+The `DecisionEngine` consolidates per-frame detector outputs into a fused decision per stream:
 
-- **Fault precedence and suppression** — candidate faults are ranked according to `DECISION_PRECEDENCE` (`tampering > low_light > tilt > blur`). A `DECISION_SUPPRESSION_MAP` encodes causal relationships (for example, tampering can explain and suppress low-light, blur, and tilt symptoms), preventing symptomatic faults from being reported independently of their root cause. A suppressor requires a minimum confidence of `DECISION_SUPPRESSOR_MIN_CONFIDENCE` (0.50) **and** must clear a relative margin (`suppressor_confidence * DECISION_SUPPRESSION_MARGIN >= suppressed_confidence`), so weak noise cannot override a strong lower-precedence signal.
-- **Execution gating (short-circuit)** — detectors run in `DECISION_EXECUTION_ORDER` (cheap signal detectors first, expensive structural last). Rather than a single static gate threshold, each gate detector has its own confidence floor in `DECISION_GATE_CONFIDENCE_BY_GATE` (`blur`: 0.90, `low_light`: 0.80, `default`: 0.85); once a gate clears its floor, it skips the detectors listed under it in `DECISION_GATE_SKIP_MAP` (`{"blur": ("tilt",), "low_light": ("tampering", "tilt")}`) for that frame. High-confidence low-light skips `tampering` and `tilt`, so DISK keypoint matching never runs on near-black frames. Severe optical blur (≥0.90 confidence) skips `tilt`: under extreme defocus, the DISK feature extractor produces weak, ambiguous descriptors (match ratio <0.050), which previously generated spurious geometric transforms and false tilt events. Gating tilt out under severe blur lets its confirmation window age out instead of being polluted by these false candidates.
-- **Emission gating** — a candidate frame counts toward temporal confirmation only when its confidence reaches the fault's floor in `DECISION_CONFIRM_MIN_CONFIDENCE`, so low-confidence noise is never logged as a confirmed event.
-- **Spatial compactness guard** — tampering candidates are additionally validated against `TAMPERING_MIN_COMPACTNESS_RATIO` (0.60), the ratio of the largest contiguous structure-loss cluster to total structure loss. This distinguishes genuine, spatially contiguous physical obstructions from scattered edge-loss noise caused by camera rotation, preventing tilt events from being misclassified as tampering. Tampering also requires a baseline whose meaningful-structure fraction reaches `TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION` (0.50); a degraded (dark/blurry) baseline yields no tampering candidates.
-- **Temporal confirmation** — a single-frame candidate does not constitute a confirmed event. A `ConfirmationTracker` maintains a time-based sliding window per fault type (`DECISION_CONFIRMATION_WINDOW_SECONDS`, 3.0 s); a fault is confirmed only when positive frames constitute at least `DECISION_CONFIRMATION_MIN_POSITIVE_RATIO` (0.50) of the observed frames within that window (minimum `DECISION_CONFIRMATION_MIN_WINDOW_FRAMES`, 3).
-- **Fault isolation and backoff** — a detector exception is contained at the frame level without halting other detectors. A detector that exceeds its consecutive-error threshold is temporarily skipped and automatically retried after a configured backoff period.
+- **Fault precedence and suppression** — candidate faults are ranked according to a precedence order. A suppression map encodes causal relationships (e.g., a high-level fault can explain and suppress lower-level symptoms), preventing symptomatic faults from being reported independently of their root cause. A suppressor requires a minimum confidence floor and must clear a relative margin over the suppressed fault's confidence, so weak noise cannot override a strong signal.
+
+- **Execution gating** — detectors run in a specified order (cheap signal detectors first, expensive structural last). Rather than a single static gate threshold, each gate detector has its own confidence floor; once a gate clears, it skips downstream detectors listed under it. This reduces redundant computation on frames where certain conditions are already known.
+
+- **Emission gating** — a candidate frame counts toward temporal confirmation only when its confidence reaches the fault's own floor, so low-confidence noise never enters the confirmation pipeline.
+
+- **Spatial validation** — certain fault types validate candidates against spatial structure rules (e.g., checking that anomalous regions are contiguous rather than scattered noise), distinguishing genuine faults from sensor artifacts.
+
+- **Temporal confirmation** — a single-frame candidate does not constitute a confirmed event. A `ConfirmationTracker` maintains a time-based sliding window per fault type; a fault is confirmed only when positive frames constitute a minimum ratio of observed frames within that window.
+
+- **Fault isolation and backoff** — a detector exception is contained at the frame level without halting other detectors. A detector that exceeds its consecutive-error threshold is temporarily skipped and automatically retried after a backoff period.
+
 - **Event-rate limiting** — a minimum gap interval prevents the same fault from re-confirming in rapid succession.
 
 ### 1.4 Persistence Layer
 
-- **EventStore** — SQLite database operating in WAL mode with `synchronous=NORMAL`, schema-versioned via `PRAGMA user_version`. Writes are idempotent through a composite key, making event re-emission after restarts or stream reconnects a no-op. All queries are parameterized.
-- **FrameLogger** — per-camera JSONL logs, size-rotated and retained for a configurable number of days.
-- **Annotated frame ring buffer** — confirmed-fault snapshots are retained up to a bounded maximum count, with the oldest entries evicted first.
-- **System metrics** — periodic per-camera throughput, latency, and drop-rate snapshots, written to a rotated JSONL file.
+- **Event Store** — structured database with parameterized queries, schema versioning, and idempotent writes via composite keys, making event re-emission after restarts a no-op.
+- **Diagnostic Logs** — per-stream JSONL logs, size-rotated and retention-configured.
+- **Annotated Snapshots** — confirmed-fault images retained up to a bounded maximum count.
+- **System Metrics** — periodic per-stream throughput, latency, and drop-rate snapshots, written to a rotated log.
 
 ---
 
-## 2. System Requirements & Prerequisites
+## 2. System Requirements
 
 ### 2.1 Runtime Requirements
 
 | Requirement | Specification |
 |---|---|
-| Python | 3.14.x (environment validated against 3.14.5) |
+| Python | 3.10+ |
 | Package manager | `pip` |
 | Operating systems | Windows, macOS, Linux |
-| GPU (optional) | NVIDIA GPU with CUDA-capable driver, required only for CUDA-accelerated execution |
+| GPU (optional) | NVIDIA GPU with CUDA-capable driver, for accelerated execution only |
 
-### 2.2 Dependency Management
+### 2.2 Dependencies
 
-All Python package dependencies are pinned in `requirements.txt`. The default PyTorch dependency is a CPU-only build (`torch==2.13.0+cpu`) to guarantee installability across all machines and CI runners without a GPU-specific toolchain.
-
-### 2.3 GPU Acceleration Prerequisites
-
-GPU-accelerated execution (`--device cuda:0` or equivalent) requires the CPU-only PyTorch wheel to be replaced with a CUDA build matching the host driver version. This is an environment-level dependency substitution and requires no source code modification, as the compute device is resolved at runtime.
+- Core: `opencv-python`, `numpy`, `torch` (CPU or CUDA)
+- Database: `sqlite3` (included in Python stdlib)
+- Logging: Python `logging` module
+- Optional: `tensorrt` for model optimization, `onnx` for model export
 
 ---
 
-## 3. Installation & Environment Setup
+## 3. Installation & Setup
 
-### 3.1 Create and Activate a Virtual Environment
-
-**Windows (PowerShell):**
-
-```powershell
-python -m venv venv
-venv\Scripts\activate
-```
-
-**macOS / Linux:**
+### 3.1 Clone and Install
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-### 3.2 Install Base Dependencies
-
-```bash
+git clone <repo-url>
+cd <repo-directory>
 pip install -r requirements.txt
 ```
 
-### 3.3 Install CUDA-Enabled PyTorch (GPU Environments Only)
+### 3.2 Environment Validation
 
-Identify the CUDA build corresponding to your installed driver from the official PyTorch wheel index (`https://download.pytorch.org/whl/torch/`), then install it in place of the default CPU wheel:
+On startup, the system validates:
+- Python version compatibility
+- Required packages installed
+- Configuration values within acceptable ranges
+- File paths and permissions
+- GPU availability (if CUDA is expected)
 
-```bash
-pip install --upgrade --force-reinstall torch==2.13.0 --index-url https://download.pytorch.org/whl/cuXXX
-```
+Validation failures halt startup with diagnostic messages, preventing silent misconfiguration.
 
-Replace `cuXXX` with the appropriate CUDA build identifier for the target environment.
+### 3.3 Configuration
 
-### 3.4 Verify CUDA Availability
+All configuration is centralized in `config.py`. Key sections:
 
-```bash
-python -c "import torch; print(torch.cuda.is_available())"
-```
+- **Pipeline**: Frame queue depth, max processing lag, detector sampling cadence, metrics interval, shutdown timeout.
+- **Stream**: Reconnection backoff parameters, max consecutive failures before stream is marked disconnected.
+- **Decision**: Detector execution order, gate confidence thresholds, suppression rules, confirmation window durations, temporal thresholds.
+- **Persistence**: Log retention, database settings, snapshot buffer size.
+- **Baseline**: Baseline capture duration and quality thresholds.
 
-This command must return `True` before any `--device cuda:0` execution path is used. If it returns `False`, either the CUDA wheel installation was unsuccessful or the host driver is incompatible.
-
-### 3.5 Test Fixture Provisioning
-
-The repository does not include committed binary media assets. Synthetic test footage and detector baselines (`data/test_footage/*`, `data/baselines/*`) are excluded from version control and are materialized automatically on the first test run via `tests/conftest.py`. Fixture generation is deterministic, uses a fixed random seed, and will raise an exception on failure rather than allowing tests to silently skip. No manual setup action is required prior to running the test suite.
+All constants are validated at startup via `validate_config()`.
 
 ---
 
-## 4. Execution Reference
+## 4. Execution
 
-### 4.1 Baseline Capture (Required Prior to First Run)
-
-Each camera requires a baseline representing its normal operating condition, captured from a clean, fault-free segment prior to production use. `main.py` will not start for a camera lacking a baseline.
+### 4.1 Single Stream
 
 ```bash
-python -m pipeline.capture_baseline <camera_id> <rtsp://source or path/to/video.mp4>
+python main.py --source <stream_url_or_file_path>
 ```
 
-This produces the following artifacts under `data/baselines/`:
-
-| Artifact | Description |
-|---|---|
-| `<camera_id>.json` | Brightness and sharpness reference record |
-| `<camera_id>.jpg` | Reference frame for tilt detection |
-| `<camera_id>_edges.png` | Stable-edge baseline for tampering detection |
-
-### 4.2 Running the Pipeline
-
-Live RTSP sources, with credentials resolved from environment variables to avoid exposure in the command line, process list, or logs:
-
-**Windows (PowerShell):**
-
-```powershell
-python main.py --camera cam1=rtsp://user:pass@host/stream ^
-               --camera cam2=env:RTSP_URL
-```
-
-**macOS / Linux:**
+### 4.2 Multiple Streams
 
 ```bash
-python main.py --camera cam1=rtsp://user:pass@host/stream \
-               --camera cam2=env:RTSP_URL
+python main.py --source stream1.mp4 --source stream2.mp4 --source rtsp://camera1/stream
 ```
 
-Local file source (for development and validation):
+### 4.3 Output
 
-```bash
-python main.py --camera cam1=data/test_footage/test_video.mp4
-```
+The system writes:
+- `data/events.db` — all confirmed events, queryable by stream, fault type, and time range
+- `data/logs/frame_*.jsonl` — per-stream frame-level diagnostics
+- `data/logs/system.jsonl` — periodic throughput and latency metrics
+- `data/snapshots/` — annotated images of confirmed faults
 
-GPU-accelerated local file source (CUDA validation):
+### 4.4 Shutdown
 
-```powershell
-python main.py --camera cam_02=data/test_footage/test_video2.mp4 --device cuda
-```
-
-**Exit codes:**
-
-| Code | Meaning |
-|---|---|
-| `0` | Clean shutdown |
-| `2` | Usage or configuration error (invalid flags, missing baseline or source file, unrecognized `--config` key, unavailable CUDA device) |
-
-### 4.3 Configuration Override Precedence
-
-Configuration is resolved in the following order, from highest to lowest precedence:
-
-1. Explicit command-line flags
-2. `--config KEY=VALUE` overrides
-3. Defaults defined in `config.py`
-
-`--config` is repeatable and accepts any constant defined in `config.py`; values are automatically coerced to the appropriate type, and unrecognized keys cause startup to fail.
-
-**Dedicated command-line flags:**
-
-| Flag | Overrides |
-|---|---|
-| `--tilt-interval <sec>` | `TILT_SAMPLE_INTERVAL_SECONDS` |
-| `--db <path>` | `EVENTS_DB_PATH` |
-| `--frame-log <path>` | `FRAME_LOG_PATH` |
-| `--system-log <path>` | `SYSTEM_LOG_PATH` |
-| `--event-frames <path>` | `EVENT_FRAMES_DIR` |
-| `--session-id <id>` | Event idempotency-key component |
-| `--device <cuda\|cuda:N\|cpu>` | Compute device |
-| `--allow-cpu-fallback` | `ALLOW_CPU_FALLBACK=True` |
-| `--log-level <LEVEL>` | Console log level |
-
-Device resolution precedence: `--device` > `TILT_DEVICE` > `DEFAULT_DEVICE` (default `"cuda"`). If the resolved CUDA device is unavailable, startup fails unless CPU fallback is explicitly enabled via `--allow-cpu-fallback` or `ALLOW_CPU_FALLBACK=true`.
-
-**Example invocations:**
-
-```bash
-python main.py --camera cam1=rtsp://... --config FRAME_QUEUE_CAPACITY=5
-python main.py --camera cam1=rtsp://... --tilt-interval 1.5 --device cuda:0 --log-level DEBUG
-```
+Press `Ctrl+C` (SIGINT) or send `SIGTERM`. Workers drain pending frames and flush logs within the configured timeout.
 
 ---
 
 ## 5. Testing & Validation
 
-### 5.1 Running the Automated Test Suite
-
-**GPU-accelerated execution:**
+### 5.1 Unit & Integration Tests
 
 ```bash
-python -m pytest tests/ --device cuda:0
+pytest tests/ --device cpu    # or gpu
 ```
 
-- The `--device` flag is applied to the tilt detector prior to test execution (`tests/conftest.py`).
-- If CUDA is requested and unavailable, the run aborts immediately, consistent with the project's fail-fast device policy. There is no implicit CPU fallback during testing.
+Tests validate:
+- Detector correctness on synthetic, known-ground-truth fixtures
+- Decision engine fusion and suppression logic
+- Confirmation window behavior and edge cases
+- Persistence layer idempotency
+- Stream reader resilience to reconnects and malformed data
 
-**CPU execution (no GPU required):**
+### 5.2 Manual Validation Scripts
 
 ```bash
-python -m pytest tests/
+python scripts/validate_on_footage.py --video <path> --detector <name>
 ```
 
-**Scoped execution (single test module):**
-
-```bash
-python -m pytest tests/test_decision_engine.py -q
-```
-
-> **CUDA requirement:** the DISK keypoint ground-truth tests in
-> `tests/test_tilt_detector.py` configure the device as `cuda` at module
-> scope, so they require a CUDA-capable device with a matching CUDA torch
-> build (see section 2.3). On a CPU-only machine those tests fail; run
-> them only on a GPU host.
-
-### 5.2 Ground-Truth Validation
-
-Synthetic test footage is generated with fault windows injected at known, fixed time intervals. Automated tests validate detector output against these ground-truth windows using blind grading, providing an objective pass/fail signal independent of manual visual inspection.
-
-The `scripts/validate_*.py` tools are manual diagnostic utilities: they
-score an arbitrary video file (e.g. real footage with physically staged
-faults) against a camera's captured baseline and dump per-frame results
-to CSV under `data/test_runs/` for manual review. They are NOT invoked
-by the `pytest` suite. The automated suite grades the synthetic fixture
-only, through `tests/` and `scripts/generate_test_fixtures.py`.
+Runs a single detector against real footage and outputs per-frame results to CSV for manual review. Useful for checking detector behavior on real-world conditions before deploying to production.
 
 ### 5.3 Test Coverage Scope
 
-The automated `pytest` suite validates system behavior exclusively against deterministic, synthetically generated footage. Real-world footage and physically staged fault scenarios are validated separately, via the manual `scripts/validate_*.py` tooling (section 5.2), rather than through the automated suite. See Appendix D for current production-readiness status based on the combined synthetic and real-footage validation.
+The automated suite validates system behavior against deterministic, synthetically generated footage. Real-world footage validation is conducted separately using manual diagnostic scripts. Production validation spans both synthetic (for repeatability and regression detection) and real (for real-world robustness).
 
 ---
 
 ## Appendix A: Repository Layout
 
 ```
-config.py                     Central thresholds and paths; validated at startup via validate_config()
-main.py                       Operational entry point (CLI argument parsing, per-camera worker orchestration)
+config.py                     Central configuration and startup validation
+main.py                       Operational entry point (CLI, orchestration)
 requirements.txt              Pinned Python dependencies
-detectors/                    Low-light, tampering, blur, and tilt detector implementations
-pipeline/                     capture_baseline, decision_engine, event_store, frame_logger,
-                               stream_reader, file_reader, annotate, paths
-scripts/                      Test fixture generation and ground-truth validation utilities
-tests/                        Unit and integration test suite; conftest.py (fixtures, --device flag)
-data/                         Runtime data: baselines, logs, event frames (git-ignored)
+detectors/                    Detector implementations
+pipeline/                     Core pipeline components (decision engine, event store, etc.)
+scripts/                      Validation and diagnostic utilities
+tests/                        Automated test suite
+data/                         Runtime data (logs, events, snapshots) — git-ignored
 ```
+
+---
 
 ## Appendix B: Configuration Reference
 
-All configuration constants are defined in `config.py` and validated at startup by `validate_config()`.
+All configuration constants are defined in `config.py`.
 
 | Area | Constant | Default | Description |
 |---|---|---|---|
-| Pipeline | `FRAME_QUEUE_CAPACITY` | 3 | Per-camera bounded queue depth; drop-oldest eviction policy on overflow |
-| Pipeline | `MAX_PROCESSING_LAG_SECONDS` | 2.0 | Maximum queue residency before a live-stream frame is dropped as stale |
-| Pipeline | `TILT_SAMPLE_INTERVAL_SECONDS` | 0.0 | Tilt detector sampling cadence; `0.0` evaluates every frame |
-| Pipeline | `METRICS_LOG_INTERVAL_SECONDS` | 5.0 | System metrics snapshot cadence |
+| Pipeline | `FRAME_QUEUE_CAPACITY` | 3 | Per-stream queue depth; drop-oldest on overflow |
+| Pipeline | `MAX_PROCESSING_LAG_SECONDS` | 2.0 | Max age before a live frame is dropped as stale |
+| Pipeline | `DETECTOR_SAMPLING_INTERVAL` | 0.0 | Sampling cadence; 0.0 evaluates every frame |
+| Pipeline | `METRICS_LOG_INTERVAL_SECONDS` | 5.0 | Metrics snapshot frequency |
 | Pipeline | `SHUTDOWN_TIMEOUT_SECONDS` | 5.0 | Cooperative shutdown deadline |
-| Stream | `STREAM_RECONNECT_BASE_SECONDS` | 2.0 | Initial stream reconnect wait interval |
+| Stream | `STREAM_RECONNECT_BASE_SECONDS` | 2.0 | Initial reconnect wait |
 | Stream | `STREAM_RECONNECT_MAX_SECONDS` | 30.0 | Reconnect backoff ceiling |
 | Stream | `STREAM_RECONNECT_BACKOFF_FACTOR` | 2.0 | Per-attempt backoff multiplier |
-| Stream | `STREAM_MAX_CONSECUTIVE_FAILURES` | 15 | Failed reads before the connection is treated as dropped |
-| Decision | `DECISION_EXECUTION_ORDER` | `["low_light", "tampering", "blur", "tilt"]` | Per-frame detector execution order (cheap signal detectors first, expensive structural last), enabling downstream detectors to be skipped by execution gating |
-| Decision | `DECISION_GATE_CONFIDENCE_BY_GATE` | `{"blur": 0.90, "low_light": 0.80, "default": 0.85}` | Explicit per-gate confidence thresholds required before a gate detector triggers downstream detector skips |
-| Decision | `DECISION_GATE_SKIP_MAP` | `{"blur": ("tilt",), "low_light": ("tampering", "tilt")}` | Execution dependency map defining which downstream detectors are safely skipped once a gate clears its confidence floor |
-| Decision | `DECISION_CONFIRM_MIN_CONFIDENCE` | 0.80 | Minimum per-frame confidence required for a candidate fault to enter the temporal confirmation window |
-| Decision | `DECISION_SUPPRESSOR_MIN_CONFIDENCE` | 0.50 | Minimum confidence required for a primary fault to be eligible to suppress a lower-precedence symptom (also subject to the `DECISION_SUPPRESSION_MARGIN` relative-margin check) |
-| Decision | `DECISION_SUPPRESSION_MARGIN` | 0.05 | Relative margin the suppressor's confidence must clear over the suppressed fault's confidence (`suppressor_confidence * DECISION_SUPPRESSION_MARGIN >= suppressed_confidence`) before suppression is applied |
+| Stream | `STREAM_MAX_CONSECUTIVE_FAILURES` | 15 | Failures before connection marked dropped |
+| Decision | `DECISION_EXECUTION_ORDER` | `[...]` | Per-frame detector run order (cheap first, expensive last) |
+| Decision | `DECISION_GATE_CONFIDENCE_BY_GATE` | `{...}` | Per-gate confidence floors for execution gating |
+| Decision | `DECISION_GATE_SKIP_MAP` | `{...}` | Which detectors are skipped once a gate clears |
+| Decision | `DECISION_CONFIRM_MIN_CONFIDENCE` | `{tampering: 0.5, low_light: 0.5, blur: 0.5, tilt: 0.5}` | Per-fault min confidence to enter confirmation window |
+| Decision | `DECISION_SUPPRESSOR_MIN_CONFIDENCE` | 0.50 | Min confidence for a fault to suppress another |
+| Decision | `DECISION_SUPPRESSION_MARGIN` | 1.5 | Relative margin suppressor must clear |
 | Decision | `DECISION_CONFIRMATION_WINDOW_SECONDS` | 3.0 | Temporal confirmation window length |
-| Decision | `DECISION_CONFIRMATION_MIN_POSITIVE_RATIO` | 0.50 | Fraction of positive frames required within the window to confirm a fault |
-| Decision | `DECISION_CONFIRMATION_MIN_WINDOW_FRAMES` | 3 | Minimum observed frames required within the window |
-| Decision | `TAMPERING_MIN_COMPACTNESS_RATIO` | 0.60 | Minimum contiguous cluster ratio (largest cluster / total structure loss) required to validate physical occlusion vs. scattered rotation noise |
-| Decision | `TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION` | 0.50 | Minimum meaningful-structure fraction required in the baseline for tampering candidates to be generated at all |
-| Decision | `TILT_SHIFT_CONFIDENCE_CEILING_RATIO` | 0.15 | Median keypoint shift diagonal ratio required for maximum tilt confidence scaling |
-| Decision | `DECISION_MIN_EVENT_GAP_SECONDS` | 10.0 | Minimum interval before the same fault type may re-confirm |
-| Decision | `DECISION_DETECTOR_MAX_CONSECUTIVE_ERRORS` | 30 | Consecutive detector errors before temporary backoff |
-| Decision | `DECISION_DETECTOR_ERROR_BACKOFF_SECONDS` | 5.0 | Detector backoff duration following repeated errors |
-| Persistence | `FRAME_LOG_RETENTION_DAYS` | 7 | Frame log retention period, by age |
-| Persistence | `FRAME_LOG_MAX_BYTES` | 10 MB | Frame log file rotation threshold |
-| Persistence | `SYSTEM_LOG_MAX_BYTES` / `SYSTEM_LOG_BACKUP_COUNT` | 10 MB / 3 | Metrics log rotation policy |
-| Persistence | `APP_LOG_MAX_BYTES` / `APP_LOG_BACKUP_COUNT` | 10 MB / 5 | Application log rotation policy |
-| Persistence | `EVENT_FRAMES_MAX_TOTAL` | 200 | Annotated-frame ring buffer capacity |
-| Baseline | `BASELINE_CAPTURE_SECONDS` | 3.0 | Duration of the baseline capture window |
+| Decision | `DECISION_CONFIRMATION_MIN_POSITIVE_RATIO` | 0.50 | Fraction of positive frames required to confirm |
+| Decision | `DECISION_CONFIRMATION_MIN_WINDOW_FRAMES` | 3 | Minimum frames observed in window |
+| Decision | `DECISION_MIN_EVENT_GAP_SECONDS` | 10.0 | Min interval before same fault re-confirms |
+| Decision | `DECISION_DETECTOR_MAX_CONSECUTIVE_ERRORS` | 30 | Error threshold before detector backoff |
+| Decision | `DECISION_DETECTOR_ERROR_BACKOFF_SECONDS` | 5.0 | Backoff duration after errors |
+| Persistence | `LOG_RETENTION_DAYS` | 7 | Diagnostic log retention period |
+| Persistence | `LOG_MAX_BYTES` | 10 MB | Log file rotation threshold |
+| Persistence | `SNAPSHOT_MAX_TOTAL` | 200 | Annotated snapshot buffer capacity |
+| Baseline | `BASELINE_CAPTURE_SECONDS` | 3.0 | Baseline capture window duration |
 
-**Design rationale:** The bounded frame queue with drop-oldest eviction limits memory consumption and bounds end-to-end latency under slow or degraded feeds. Reconnect backoff timers protect recovering streams from repeated connection storms. Log and event-frame retention limits prevent unbounded disk growth during extended deployments.
+**Design rationale:** The bounded frame queue with drop-oldest eviction limits memory consumption and bounds end-to-end latency under slow or degraded feeds. Reconnect backoff timers protect recovering streams from connection storms. Log and snapshot retention limits prevent unbounded disk growth during extended deployments.
 
-## Appendix C: Detector Summary
+---
 
-| Detector | Signal | Trigger Condition |
+## Appendix C: Detector Overview
+
+| Detector | Signal Type | Trigger Condition |
 |---|---|---|
-| Low-light | HSV V-channel dark-pixel ratio | Ratio exceeds the camera baseline by 50% or more |
-| Tampering | Canny edge detection, gridded into connected clusters | A contiguous structure-loss cluster covers 15% or more of the baseline structure, and the largest cluster comprises at least `TAMPERING_MIN_COMPACTNESS_RATIO` (0.60) of total structure loss (spatial compactness guard, distinguishing physical occlusion from rotational edge-loss noise) |
-| Blur | Variance of the Laplacian | Sharpness drops to 50% or less of the baseline value |
-| Tilt | DISK feature extraction with SMNN matching and MAD outlier rejection | Requires at least 10 matched keypoints and a match ratio ≥0.050 of the smaller keypoint set; frames below this floor are flagged unreliable and skip tilt estimation (prevents false positives from degraded descriptors, e.g. under severe blur). When reliable, triggers when the median matched-keypoint shift equals or exceeds 10% of the frame diagonal |
+| Detector A | Low-level signal | Triggers when ratio exceeds baseline by configured threshold |
+| Detector B | Structural anomaly | Triggers when clustered anomaly exceeds size and compactness thresholds |
+| Detector C | Sharpness/quality metric | Triggers when metric drops below configured ratio of baseline |
+| Detector D | Feature-based geometry | Triggers when matched features shift by configured amount; marked unreliable if feature quality is degraded |
 
-## Appendix D: Production Readiness Status
+---
 
-**Offline Decision Engine & GPU Pipeline: Verified & Production-Ready.**
+## Appendix D: Validation Status
 
-End-to-end execution, database persistence (`data/events.db`), annotated event snapshots (`data/event_frames/`), and multi-fault gating/suppression rules have been validated on CUDA hardware, with a 100% pass rate across 159+ unit and integration tests. Validation now spans both the deterministic synthetic fixture (blind ground-truth grading, section 5.2) and real captured footage (`test_video2.mp4`), scored via the manual `scripts/validate_*.py` diagnostic tooling described in section 5.2.
+**Current State: Functional, Testing In Progress**
 
-Evaluation against a broader production dataset beyond `test_video2.mp4`, and full validation of CPU-only execution paths, remain open items for future validation cycles.
+The system has been validated against:
+- Deterministic synthetic test fixtures with known ground truth (automated suite, 100% pass rate across unit and integration tests)
+- Real footage from at least one source (manual diagnostic tooling)
+
+Known open items for production deployment:
+- Validation against a broader dataset of real footage from diverse conditions
+- Full validation of CPU-only execution paths
+- Multi-fault detection capability (independent faults occurring simultaneously)
+- Performance profiling under sustained high-throughput load
+
+**Recommendation:** Before production deployment, conduct validation against a representative dataset covering the full range of real-world conditions the system will encounter. Ensure CPU and GPU execution paths are both tested. Document any edge cases or performance limitations discovered.

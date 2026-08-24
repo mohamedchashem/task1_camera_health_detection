@@ -26,7 +26,7 @@ from pipeline.decision_engine import (
     DecisionFrame,
 )
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class FrameLogger:
@@ -156,6 +156,15 @@ class FrameLogger:
             "confidence": round(frame.confidence, 6),
             "secondary_symptoms": list(frame.secondary_symptoms),
             "suppressed_faults": list(frame.suppressed_faults),
+            # Multi-label survivors (schema v2): each active fault and its
+            # confidence, in DECISION_PRECEDENCE order.
+            "faults": [
+                {
+                    "fault_type": fault.fault_type,
+                    "confidence": round(fault.confidence, 6),
+                }
+                for fault in frame.faults
+            ],
             "temporal_status": dict(frame.temporal_confirmation_status),
             "detectors": {
                 obs.detector: {

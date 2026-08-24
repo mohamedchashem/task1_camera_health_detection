@@ -38,3 +38,4 @@ Thumbs.db
 
 # Local AI assistant rules
 .clinerules/
+.cline_state/

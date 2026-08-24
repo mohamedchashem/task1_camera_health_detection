@@ -802,6 +802,10 @@ class CameraWorker(threading.Thread):
             secondary_symptoms=secondary,
             suppressed_faults=suppressed,
             video_time_s=decision.video_time_s,
+            # Multi-label: render every active fault on this frame stacked
+            # vertically (each with its own confidence); the event's own
+            # fault is one of them.
+            faults=decision.faults,
         )
         save_annotated_frame(
             annotated,

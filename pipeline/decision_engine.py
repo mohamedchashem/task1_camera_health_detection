@@ -274,6 +274,13 @@ def resolve_active_faults(candidates: Mapping[str, float]) -> tuple[Fault, ...]:
         Output is deterministic: candidates are visited in precedence order
         and survivors keep that order.
     """
+    # E2 note: Under the current DECISION_SUPPRESSION_MAP, every fault pair
+    # is causally connected (tilt suppresses blur, low_light suppresses tilt/blur,
+    # tampering suppresses everything). Multi-label events naturally occur only when:
+    # - a suppressor's confidence is below DECISION_SUPPRESSOR_MIN_CONFIDENCE, OR
+    # - the relative margin check fails (suppressor_conf * margin < suppressed_conf)
+    # True independent concurrent faults (e.g. blur + tilt from unrelated causes)
+    # would require relaxing the suppression map.
     ranked = sorted(candidates, key=lambda fault: _FAULT_RANK[fault])
     survivors: list[Fault] = []
     for fault in ranked:

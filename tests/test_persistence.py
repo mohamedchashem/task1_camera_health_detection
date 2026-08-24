@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from config import EVENT_FRAMES_MAX_TOTAL
-from pipeline.annotate import annotate_frame, save_annotated_frame
+from pipeline.annotate import annotate_frame, build_annotation_lines, save_annotated_frame
 from pipeline.decision_engine import (
     DETECTOR_STATUS_ERROR,
     DETECTOR_STATUS_OK,
@@ -22,8 +22,9 @@ from pipeline.decision_engine import (
     ConfirmedFault,
     DecisionFrame,
     DetectorObservation,
+    Fault,
 )
-from pipeline.event_store import EventStore
+from pipeline.event_store import EventStore, build_event_key
 from pipeline.frame_logger import FrameLogger
 
 
@@ -60,6 +61,9 @@ def _decision_frame(
     primary: str | None = None,
     error_detector: bool = False,
     skipped_detector: bool = False,
+    secondary: tuple[str, ...] = (),
+    suppressed: tuple[str, ...] = (),
+    faults: tuple[Fault, ...] = (),
 ) -> DecisionFrame:
     observations = [DetectorObservation("low_light", DETECTOR_STATUS_OK, False, 0.1)]
     if error_detector:
@@ -82,10 +86,11 @@ def _decision_frame(
         video_time_s=float(number),
         primary_fault=primary,
         confidence=0.8 if primary else 0.0,
-        secondary_symptoms=(),
-        suppressed_faults=(),
+        secondary_symptoms=secondary,
+        suppressed_faults=suppressed,
         temporal_confirmation_status={"blur": "confirmed"} if primary == "blur" else {},
         detectors=tuple(observations),
+        faults=faults,
     )
 
 
@@ -149,6 +154,24 @@ def test_session_id_participates_in_idempotency_key(tmp_path: Path) -> None:
     store.close()
 
 
+def test_event_store_multi_fault_same_frame_do_not_collide(tmp_path: Path) -> None:
+    # Multi-label: two faults confirmed on the exact same frame timestamp
+    # must not collide in SQLite. fault_type is part of the composite
+    # idempotency key, so each event gets its own row (first write wins per
+    # key, but the keys differ).
+    store = EventStore(tmp_path / "events.db")
+    blur = _event(fault_type="blur", started_frame=7, started_time_s=1.0)
+    tilt = _event(fault_type="tilt", started_frame=7, started_time_s=1.0)
+    assert blur.started_frame == tilt.started_frame
+    assert blur.started_time_s == tilt.started_time_s
+    assert build_event_key(blur) != build_event_key(tilt)
+    assert store.insert_confirmed_fault(blur) is True
+    assert store.insert_confirmed_fault(tilt) is True
+    assert store.insert_confirmed_fault(blur) is False  # same fault -> idempotent
+    assert len(store.query_events()) == 2
+    store.close()
+
+
 def test_confirmed_and_cleared_rows_coexist(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "events.db")
     assert store.insert_confirmed_fault(_event(status="confirmed")) is True
@@ -190,13 +213,47 @@ def test_frame_logger_writes_valid_jsonl(tmp_path: Path) -> None:
     lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(lines) == 1
     record = json.loads(lines[0])
-    assert record["schema_version"] == 1
+    assert record["schema_version"] == 2
     assert record["camera_id"] == "cam1"
     assert record["frame_number"] == 1
     assert record["primary_fault"] == "blur"
+    assert record["faults"] == []  # schema v2: no active faults on this frame
     assert record["confidence"] == pytest.approx(0.8)
     assert record["latency_ms"] == pytest.approx(3.5)
     assert record["detectors"]["blur"]["is_candidate"] is True
+
+
+def test_frame_logger_serializes_multi_fault_view(tmp_path: Path) -> None:
+    # Multi-label: primary is the top-precedence survivor, secondary are the
+    # remaining survivors, suppressed are the candidates that lost fusion,
+    # and faults is the explicit multi-label active tuple (schema v2).
+    path = tmp_path / "frame_log.jsonl"
+    logger = FrameLogger(path, interval_frames=1, flush_interval_frames=1, retention_days=7)
+    logger.open()
+    logger.write_frame(
+        _decision_frame(
+            2,
+            primary="tampering",
+            secondary=("blur",),
+            suppressed=("low_light",),
+            faults=(Fault("tampering", 0.85), Fault("blur", 0.62)),
+        )
+    )
+    logger.close()
+
+    record = json.loads(
+        [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()][0]
+    )
+    assert record["primary_fault"] == "tampering"
+    assert record["confidence"] == pytest.approx(0.8)
+    assert record["secondary_symptoms"] == ["blur"]
+    assert record["suppressed_faults"] == ["low_light"]
+    # Each surviving fault is serialized with fault_type + confidence, in
+    # DECISION_PRECEDENCE order (tampering ranks above blur).
+    assert record["faults"] == [
+        {"fault_type": "tampering", "confidence": pytest.approx(0.85)},
+        {"fault_type": "blur", "confidence": pytest.approx(0.62)},
+    ]
 
 
 def test_frame_logger_sampling_logs_only_interval_frames(tmp_path: Path) -> None:
@@ -303,6 +360,40 @@ def test_annotate_frame_returns_overlaid_copy() -> None:
 
     no_fault = annotate_frame(frame, None, 0.0)
     assert no_fault.shape == frame.shape
+
+
+def test_annotate_frame_stacks_multiple_active_faults() -> None:
+    # Multi-label: each active fault in DecisionFrame.faults renders as its
+    # own stacked FAULT line (precedence order), each with its confidence.
+    faults = (Fault("tampering", 0.85), Fault("blur", 0.62))
+    lines = build_annotation_lines(
+        "tampering",
+        0.85,
+        faults=faults,
+        secondary_symptoms=("blur",),
+        suppressed_faults=("low_light",),
+        video_time_s=1.5,
+    )
+    assert lines == [
+        "FAULT: tampering (conf=0.85)",
+        "FAULT: blur (conf=0.62)",
+        "suppressed: low_light",
+        "t=1.50s",
+    ]
+
+    frame = np.zeros((120, 240, 3), dtype=np.uint8)
+    annotated = annotate_frame(
+        frame,
+        "tampering",
+        0.85,
+        faults=faults,
+        suppressed_faults=("low_light",),
+        video_time_s=1.5,
+    )
+    assert annotated.shape == frame.shape
+    assert annotated.dtype == frame.dtype
+    assert annotated.sum() > 0  # text was actually drawn
+    assert frame.sum() == 0  # the input frame is untouched
 
 
 def test_save_annotated_frame_writes_snapshot(tmp_path: Path) -> None:

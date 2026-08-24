@@ -1,0 +1,28 @@
+# Exclude model weights and media
+*.pt
+*.onnx
+*.engine
+*.bin
+*.pth
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.avi
+
+# Exclude build & environment directories
+.venv/
+venv/
+__pycache__/
+*.egg-info/
+dist/
+build/
+
+# Exclude logs and data outputs
+logs/
+*.log
+runs/
+wandb/
+
+# Exclude safe_run state & log files
+.cline_state/

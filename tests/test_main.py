@@ -434,16 +434,21 @@ def test_worker_annotates_each_event_with_its_own_fault(tmp_path: Path, monkeypa
     # not the frame's fused primary (regression: every snapshot used to show
     # the same fused label).
     #
-    # A candidate suppressed by the precedence rules no longer registers a
-    # positive sample in its own confirmation tracker, so tampering, blur and
-    # tilt can no longer confirm on the same frame. They now confirm in three
-    # separate windows -- tampering (whose signal causally suppresses
-    # blur/tilt while they fire), then blur (with tampering/tilt firing below
-    # the suppressor gate so they stay secondary symptoms), then tilt (with
-    # blur suppressed by tilt and tampering below the gate). On every
-    # confirmation frame the other detectors still fire as candidates, so the
-    # per-event secondary/suppressed banner lists below are exercised exactly
-    # as before.
+    # Multi-label fusion: suppressed candidates no longer register positive
+    # samples in their own confirmation trackers, and the blur execution gate
+    # (blur >= 0.9, DECISION_GATE_CONFIDENCE_BY_GATE) skips the unmeasurable
+    # tilt detector on severely blurred frames. The three faults therefore
+    # confirm in three separate windows:
+    # - tampering (frames 1-3): blur fires at frame 3 but is causally
+    #   suppressed by tampering; tilt is skipped by the blur gate;
+    # - blur (frames 5-7): tampering fires at frame 7 below its emission
+    #   floor, so it stays a secondary symptom in blur's banner;
+    # - tilt (frames 11-13): blur fires at frame 13 just below its gate floor
+    #   (0.8 < 0.9) so tilt remains measurable, and blur is causally
+    #   suppressed by tilt; tampering fires below its floor.
+    # On every confirmation frame the other detectors still fire as
+    # candidates, so the per-event secondary/suppressed banner lists below
+    # are exercised.
     def _marker_frame(frame_number: int) -> np.ndarray:
         frame = _frame()
         frame[0, 0, 0] = frame_number
@@ -487,10 +492,10 @@ def test_worker_annotates_each_event_with_its_own_fault(tmp_path: Path, monkeypa
             5: _Result(True, 0.9),
             6: _Result(True, 0.9),
             7: _Result(True, 0.9),
-            13: _Result(True, 0.9),  # suppressed by tilt -> no tracker credit
+            13: _Result(True, 0.8),  # below blur gate floor (0.9): tilt measurable; suppressed by tilt -> no tracker credit
         }),
         "tilt": _ScriptedDetector({
-            3: _Result(True, 0.7),  # suppressed by tampering -> no tracker credit
+            3: _Result(True, 0.7),  # skipped by blur gate (blur 0.9) -> no tracker credit
             7: _Result(True, 0.1),  # below gate: secondary candidate, no suppression
             11: _Result(True, 0.7),
             12: _Result(True, 0.7),
@@ -504,7 +509,8 @@ def test_worker_annotates_each_event_with_its_own_fault(tmp_path: Path, monkeypa
     saved = []
 
     def _fake_annotate(frame, primary_fault, confidence,
-                       secondary_symptoms=(), suppressed_faults=(), video_time_s=None):
+                       secondary_symptoms=(), suppressed_faults=(), video_time_s=None,
+                       faults=()):
         annotations.append(
             (primary_fault, confidence, tuple(secondary_symptoms), tuple(suppressed_faults))
         )
@@ -547,8 +553,8 @@ def test_worker_annotates_each_event_with_its_own_fault(tmp_path: Path, monkeypa
 
     # Secondary/suppressed lists are relative to each event's detector.
     assert banner["tampering"][2] == ()                     # secondary
-    assert banner["tampering"][3] == ("tilt", "blur")       # suppressed
-    assert banner["blur"][2] == ("tampering", "tilt")
+    assert banner["tampering"][3] == ("blur",)              # suppressed (tilt was gated/skipped)
+    assert banner["blur"][2] == ("tampering",)              # secondary (tilt was gated/skipped)
     assert banner["blur"][3] == ()
     assert banner["tilt"][2] == ("tampering",)              # secondary
     assert banner["tilt"][3] == ("blur",)                   # suppressed

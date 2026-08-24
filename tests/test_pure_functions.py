@@ -23,6 +23,16 @@ from detectors.tilt import (
     inlier_ratio_sufficient,
     match_volume_sufficient,
 )
+from config import (
+    LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR,
+    TAMPERING_BLUR_AREA_SLACK,
+    TAMPERING_LOW_LIGHT_AREA_SLACK,
+)
+from pipeline.decision_engine import (
+    _area_conserved,
+    _is_near_black,
+    _pair_should_suppress,
+)
 from pipeline.paths import validate_camera_id
 
 
@@ -241,3 +251,171 @@ def test_validate_camera_id_rejects_invalid_characters() -> None:
     for camera_id in ("", "a b", "a.b", "café", "a#b"):
         with pytest.raises(ValueError):
             validate_camera_id(camera_id)
+
+# --- pipeline.decision_engine co-occurrence predicates ------------------------
+# Multi-fault co-occurrence (Phase N): standalone predicates from Subtask 3.
+# Not wired into fusion yet; tested in isolation with synthetic inputs.
+
+
+def test_area_conserved_true_when_increase_fits_within_slack() -> None:
+    # 0.5 dark-increase is explainable by a 0.4 obstruction + 0.2 slack.
+    assert _area_conserved(obstruction_coverage=0.4, measured_increase=0.5, slack=0.2)
+
+
+def test_area_conserved_false_when_increase_exceeds_slack() -> None:
+    # 0.8 dark-increase cannot be caused by a 0.4 obstruction (+0.2 slack).
+    assert not _area_conserved(obstruction_coverage=0.4, measured_increase=0.8, slack=0.2)
+
+
+def test_area_conserved_boundary_is_conserved() -> None:
+    # Exact equality (increase == coverage + slack) still counts as conserved.
+    assert _area_conserved(obstruction_coverage=0.4, measured_increase=0.6, slack=0.2)
+
+
+def test_area_conserved_zero_coverage_requires_zero_increase() -> None:
+    assert _area_conserved(obstruction_coverage=0.0, measured_increase=0.0, slack=0.0)
+    assert not _area_conserved(obstruction_coverage=0.0, measured_increase=0.01, slack=0.0)
+
+
+def test_is_near_black_at_or_above_floor() -> None:
+    assert _is_near_black(0.95, floor=0.8)
+    assert _is_near_black(0.8, floor=0.8)  # boundary equality
+
+
+def test_is_near_black_below_floor() -> None:
+    assert not _is_near_black(0.5, floor=0.8)
+
+
+# --- _pair_should_suppress relation-class routing ------------------------------
+
+
+def test_pair_should_suppress_always_uses_margin_only() -> None:
+    # tilt->blur is "always": margin decides and metrics are irrelevant.
+    assert _pair_should_suppress(
+        "tilt", "blur", {}, {}, suppressor_confidence=0.9, suppressed_confidence=1.0
+    )
+    assert not _pair_should_suppress(
+        "tilt", "blur", {}, {}, suppressor_confidence=0.5, suppressed_confidence=1.0
+    )
+
+
+def test_pair_should_suppress_conditional_tampering_low_light() -> None:
+    # Margin met AND area conserved (0.5 <= 0.4 + slack): suppress.
+    assert _pair_should_suppress(
+        "tampering", "low_light",
+        {"total_loss_fraction": 0.4}, {"relative_increase": 0.5},
+        suppressor_confidence=0.8, suppressed_confidence=0.6,
+    )
+    # Margin met but area NOT conserved (0.8 > 0.4 + slack): do not suppress.
+    assert not _pair_should_suppress(
+        "tampering", "low_light",
+        {"total_loss_fraction": 0.4}, {"relative_increase": 0.8},
+        suppressor_confidence=0.8, suppressed_confidence=0.6,
+    )
+
+
+def test_pair_should_suppress_conditional_tampering_low_light_missing_metrics() -> None:
+    # Older observations carry no metrics: the predicate is unverifiable.
+    assert not _pair_should_suppress(
+        "tampering", "low_light", {}, {},
+        suppressor_confidence=0.8, suppressed_confidence=0.6,
+    )
+
+
+def test_pair_should_suppress_conditional_tampering_blur() -> None:
+    # Blur's observed increase is the sharpness fraction lost (1 - ratio):
+    # 0.4 <= 0.5 + slack -> conserved -> suppress.
+    assert _pair_should_suppress(
+        "tampering", "blur",
+        {"total_loss_fraction": 0.5}, {"sharpness_ratio": 0.6},
+        suppressor_confidence=0.8, suppressed_confidence=0.6,
+    )
+    # Severe global blur (0.8 lost) exceeds what a 0.5 obstruction explains.
+    assert not _pair_should_suppress(
+        "tampering", "blur",
+        {"total_loss_fraction": 0.5}, {"sharpness_ratio": 0.2},
+        suppressor_confidence=0.8, suppressed_confidence=0.6,
+    )
+
+
+def test_pair_should_suppress_conditional_tampering_blur_missing_metrics() -> None:
+    assert not _pair_should_suppress(
+        "tampering", "blur", {}, {},
+        suppressor_confidence=0.8, suppressed_confidence=0.6,
+    )
+
+
+def test_pair_should_suppress_conditional_low_light_blur_near_black() -> None:
+    floor = LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR
+    # Margin met AND low-light at the near-black floor: suppress.
+    assert _pair_should_suppress(
+        "low_light", "blur", {}, {},
+        suppressor_confidence=floor, suppressed_confidence=0.5,
+    )
+    # Margin met but the scene is not near-black: do not suppress.
+    assert not _pair_should_suppress(
+        "low_light", "blur", {}, {},
+        suppressor_confidence=floor - 0.05, suppressed_confidence=0.5,
+    )
+
+
+def test_pair_should_suppress_conditional_margin_failure_short_circuits() -> None:
+    # Even with metrics that would conserve area, a failed margin check
+    # prevents suppression.
+    assert not _pair_should_suppress(
+        "tampering", "low_light",
+        {"total_loss_fraction": 0.9}, {"relative_increase": 0.1},
+        suppressor_confidence=0.4, suppressed_confidence=1.0,
+    )
+
+
+def test_pair_should_suppress_absent_pairs_never_suppress() -> None:
+    # tampering->tilt and low_light->tilt are intentionally absent from
+    # DECISION_SUPPRESSION_RULES (no physical pathway): never suppress.
+    assert not _pair_should_suppress(
+        "tampering", "tilt", {"total_loss_fraction": 0.9}, {"median_shift_ratio": 0.01},
+        suppressor_confidence=1.0, suppressed_confidence=0.5,
+    )
+    assert not _pair_should_suppress(
+        "low_light", "tilt", {"dark_pixel_ratio": 0.99}, {"median_shift_ratio": 0.01},
+        suppressor_confidence=1.0, suppressed_confidence=0.5,
+    )
+
+
+def test_pair_should_suppress_reversed_order_pair_never_suppresses() -> None:
+    # A lower-precedence fault never suppresses a higher-precedence one.
+    assert not _pair_should_suppress(
+        "blur", "tampering", {}, {},
+        suppressor_confidence=1.0, suppressed_confidence=0.1,
+    )
+
+
+def test_pair_should_suppress_uses_config_slack_constants() -> None:
+    # Tampering->low_light wiring reads the configured slack value.
+    coverage = 0.4
+    assert _pair_should_suppress(
+        "tampering", "low_light",
+        {"total_loss_fraction": coverage},
+        {"relative_increase": coverage + TAMPERING_LOW_LIGHT_AREA_SLACK},
+        0.8, 0.6,
+    )
+    assert not _pair_should_suppress(
+        "tampering", "low_light",
+        {"total_loss_fraction": coverage},
+        {"relative_increase": coverage + TAMPERING_LOW_LIGHT_AREA_SLACK + 1e-6},
+        0.8, 0.6,
+    )
+    # Tampering->blur wiring reads its own slack constant.
+    assert _pair_should_suppress(
+        "tampering", "blur",
+        {"total_loss_fraction": coverage},
+        {"sharpness_ratio": 1.0 - coverage - TAMPERING_BLUR_AREA_SLACK},
+        0.8, 0.6,
+    )
+    assert not _pair_should_suppress(
+        "tampering", "blur",
+        {"total_loss_fraction": coverage},
+        {"sharpness_ratio": 1.0 - coverage - TAMPERING_BLUR_AREA_SLACK - 1e-6},
+        0.8, 0.6,
+    )
+

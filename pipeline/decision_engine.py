@@ -15,9 +15,13 @@ Fusion contract (multi-label revision, Phase 1):
 - per-frame candidates are filtered to those reaching their per-fault
   emission floor (``DECISION_CONFIRM_MIN_CONFIDENCE``);
 - a candidate is removed when a *surviving* higher-precedence active
-  suppressor (confidence >= ``DECISION_SUPPRESSOR_MIN_CONFIDENCE`` AND
-  relative margin ``suppressor * DECISION_SUPPRESSION_MARGIN >=
-  suppressed``) lists it in ``DECISION_SUPPRESSION_MAP``;
+  suppressor (confidence >= ``DECISION_SUPPRESSOR_MIN_CONFIDENCE``)
+  suppresses it via ``_pair_should_suppress``, which routes the ordered
+  pair through ``DECISION_SUPPRESSION_RULES``: the relative margin
+  ``suppressor * DECISION_SUPPRESSION_MARGIN >= suppressed`` always, plus
+  for ``conditional`` relations a physical predicate on the two
+  candidates' raw metrics (area conservation, near-black floor). Pairs
+  absent from the rules are independent and always co-survive;
 - survivors become ``DecisionFrame.faults`` in ``DECISION_PRECEDENCE``
   order; ``primary_fault`` is the top-ranking survivor (backward
   compatible), the remaining survivors are ``secondary_symptoms``, and
@@ -47,7 +51,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -67,7 +71,11 @@ from config import (
     DECISION_PRECEDENCE,
     DECISION_SUPPRESSION_MAP,
     DECISION_SUPPRESSION_MARGIN,
+    DECISION_SUPPRESSION_RULES,
     DECISION_SUPPRESSOR_MIN_CONFIDENCE,
+    LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR,
+    TAMPERING_BLUR_AREA_SLACK,
+    TAMPERING_LOW_LIGHT_AREA_SLACK,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,6 +110,110 @@ def _margin_met(suppressor_confidence: float, suppressed_confidence: float) -> b
     )
 
 
+# Raw measurands each detector already computes and exposes on its result
+# object, copied into DetectorObservation.metrics so downstream predicate
+# logic can read physical evidence (obstruction coverage, dark ratio,
+# sharpness ratio, tilt shift) without re-running detectors. Keys are fault
+# names in DECISION_PRECEDENCE. No new calculations: only values the
+# detectors already produce internally.
+_DETECTOR_METRIC_FIELDS: Mapping[str, tuple[str, ...]] = {
+    "low_light": ("dark_pixel_ratio", "relative_increase"),
+    "tampering": ("meaningful_block_fraction", "total_loss_fraction"),
+    "blur": ("sharpness", "sharpness_ratio"),
+    "tilt": ("median_shift_ratio", "match_count"),
+}
+
+
+def _extract_detector_metrics(name: str, result: object) -> dict[str, float]:
+    """Copy ``result``'s raw measurands for detector ``name`` into a metrics dict.
+
+    Only numeric fields listed in ``_DETECTOR_METRIC_FIELDS`` for ``name`` are
+    copied. A listed field the detector does not expose (e.g. a mocked result
+    in tests) simply contributes no entry, so extraction never raises.
+    """
+    metrics: dict[str, float] = {}
+    for field_name in _DETECTOR_METRIC_FIELDS.get(name, ()):
+        value = getattr(result, field_name, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            metrics[field_name] = float(value)
+    return metrics
+
+
+def _area_conserved(obstruction_coverage: float, measured_increase: float, slack: float) -> bool:
+    """True when the suppressor's measured extent can plausibly account for
+    the suppressed detector's observed increase.
+
+    Area-conservation predicate for the ``conditional`` tampering relations:
+    the obstruction area (structure-loss blocks) must be able to explain the
+    full measured change -- ``measured_increase <= obstruction_coverage +
+    slack``. The two signals are measured on different grids, so ``slack``
+    absorbs the unavoidable extent mismatch (the ``*_AREA_SLACK`` config
+    constants). Empirical starting points, not derived from any clip.
+    """
+    return measured_increase <= obstruction_coverage + slack
+
+
+def _is_near_black(low_light_confidence: float, floor: float) -> bool:
+    """True when low-light is strong enough that the frame is near-black.
+
+    Near-black predicate for the ``conditional`` low_light->blur relation:
+    at or above ``floor`` the whole frame is unmeasurable (the existing
+    low-light gate floor), so low-light fully explains any blur signal and no
+    area check is meaningful on a black frame. ``floor`` is passed in from
+    ``LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR``.
+    """
+    return low_light_confidence >= floor
+
+
+def _pair_should_suppress(
+    suppressor: str,
+    suppressed: str,
+    suppressor_metrics: Mapping[str, float],
+    suppressed_metrics: Mapping[str, float],
+    suppressor_confidence: float,
+    suppressed_confidence: float,
+) -> bool:
+    """Decide whether ``suppressor`` suppresses ``suppressed`` on one frame.
+
+    Routes the pair through ``DECISION_SUPPRESSION_RULES``:
+    - absent from the map -> independent, never suppress;
+    - ``always`` -> the relative margin check alone decides
+      (``_margin_met``), no physical predicate;
+    - ``conditional`` -> the margin check AND the pair's specific predicate
+      (area conservation for the tampering pairs, near-black for
+      low_light->blur) must both hold before suppression applies.
+
+    Metrics dicts may be empty (older observations, mocked tests): a
+    conditional predicate that cannot read the measurand it needs returns
+    False (not verifiable -> never suppress) rather than raising.
+    """
+    relation = DECISION_SUPPRESSION_RULES.get((suppressor, suppressed))
+    if relation is None:
+        return False
+    if not _margin_met(suppressor_confidence, suppressed_confidence):
+        return False
+    if relation == "always":
+        return True
+    if relation == "conditional":
+        if (suppressor, suppressed) == ("tampering", "low_light"):
+            coverage = suppressor_metrics.get("total_loss_fraction")
+            increase = suppressed_metrics.get("relative_increase")
+            if coverage is None or increase is None:
+                return False
+            return _area_conserved(coverage, increase, TAMPERING_LOW_LIGHT_AREA_SLACK)
+        if (suppressor, suppressed) == ("tampering", "blur"):
+            coverage = suppressor_metrics.get("total_loss_fraction")
+            sharpness_ratio = suppressed_metrics.get("sharpness_ratio")
+            if coverage is None or sharpness_ratio is None:
+                return False
+            # Blur's measurand is a retention ratio (1.0 = unchanged), so the
+            # observed increase in blur is the sharpness fraction lost.
+            return _area_conserved(coverage, 1.0 - sharpness_ratio, TAMPERING_BLUR_AREA_SLACK)
+        if (suppressor, suppressed) == ("low_light", "blur"):
+            return _is_near_black(suppressor_confidence, LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR)
+    return False
+
+
 @dataclass(frozen=True)
 class DetectorObservation:
     """Result of running one detector on one frame, after isolation."""
@@ -114,6 +226,10 @@ class DetectorObservation:
     reason: str | None = None   # optional diagnostic for non-error states
                                 # ("suppressed_by_gate", "degraded_baseline",
                                 # tilt TILT_STATUS_*, ...)
+    metrics: dict[str, float] = field(default_factory=dict)
+                                # raw measurands the detector exposes on its
+                                # result (see _DETECTOR_METRIC_FIELDS), for
+                                # physical co-occurrence predicate evaluation
 
 
 @dataclass(frozen=True)
@@ -250,13 +366,18 @@ def resolve_primary_fault(
     return primary, secondary, suppressed
 
 
-def resolve_active_faults(candidates: Mapping[str, float]) -> tuple[Fault, ...]:
+def resolve_active_faults(
+    candidates: Mapping[str, DetectorObservation],
+) -> tuple[Fault, ...]:
     """Resolve the multi-label fault list for one frame.
 
     Args:
-        candidates: mapping fault_type -> confidence, for faults flagged as
-            candidates by their detector this frame (status ``ok``). Fault
-            names must be in ``DECISION_PRECEDENCE``.
+        candidates: mapping fault_type -> ``DetectorObservation`` for faults
+            flagged as candidates by their detector this frame (status
+            ``ok``). Each observation carries the candidate's confidence plus
+            the raw metrics the co-occurrence predicates read (see
+            ``_DETECTOR_METRIC_FIELDS``). Fault names must be in
+            ``DECISION_PRECEDENCE``.
 
     Returns:
         A tuple of ``Fault`` survivors in ``DECISION_PRECEDENCE`` order. A
@@ -264,33 +385,37 @@ def resolve_active_faults(candidates: Mapping[str, float]) -> tuple[Fault, ...]:
         - its confidence reaches the fault's per-fault emission floor in
           ``DECISION_CONFIRM_MIN_CONFIDENCE``; and
         - no *surviving* higher-precedence candidate actively suppresses it
-          (suppressor confidence >= ``DECISION_SUPPRESSOR_MIN_CONFIDENCE``,
-          the relative margin ``suppressor * DECISION_SUPPRESSION_MARGIN >=
-          suppressed`` clears via ``_margin_met``, and it is listed in
-          ``DECISION_SUPPRESSION_MAP``).
+          (suppressor confidence >= ``DECISION_SUPPRESSOR_MIN_CONFIDENCE``
+          and ``_pair_should_suppress`` returns True for the ordered pair,
+          which combines the relative margin check with the pair's relation
+          class in ``DECISION_SUPPRESSION_RULES``: ``always`` relations use
+          the margin alone, ``conditional`` relations additionally require a
+          physical predicate on the two observations' metrics, and pairs
+          absent from the rules are independent and never suppress).
 
         A suppressed candidate never acts as a suppressor itself, so only
         higher-precedence survivors can remove lower-precedence candidates.
         Output is deterministic: candidates are visited in precedence order
         and survivors keep that order.
     """
-    # E2 note: Under the current DECISION_SUPPRESSION_MAP, every fault pair
-    # is causally connected (tilt suppresses blur, low_light suppresses tilt/blur,
-    # tampering suppresses everything). Multi-label events naturally occur only when:
-    # - a suppressor's confidence is below DECISION_SUPPRESSOR_MIN_CONFIDENCE, OR
-    # - the relative margin check fails (suppressor_conf * margin < suppressed_conf)
-    # True independent concurrent faults (e.g. blur + tilt from unrelated causes)
-    # would require relaxing the suppression map.
     ranked = sorted(candidates, key=lambda fault: _FAULT_RANK[fault])
     survivors: list[Fault] = []
     for fault in ranked:
-        confidence = candidates[fault]
+        observation = candidates[fault]
+        confidence = observation.confidence
         if confidence < DECISION_CONFIRM_MIN_CONFIDENCE.get(fault, 0.0):
             continue
         if any(
-            candidates[s.fault_type] >= DECISION_SUPPRESSOR_MIN_CONFIDENCE
-            and _margin_met(candidates[s.fault_type], confidence)
-            and fault in DECISION_SUPPRESSION_MAP.get(s.fault_type, ())
+            candidates[s.fault_type].confidence
+            >= DECISION_SUPPRESSOR_MIN_CONFIDENCE
+            and _pair_should_suppress(
+                s.fault_type,
+                fault,
+                candidates[s.fault_type].metrics,
+                observation.metrics,
+                candidates[s.fault_type].confidence,
+                confidence,
+            )
             for s in survivors
         ):
             continue
@@ -599,14 +724,15 @@ class DecisionEngine:
                 active_gates[name] = obs.confidence
 
         candidates = {
-            obs.detector: obs.confidence
+            obs.detector: obs
             for obs in observations
             if obs.status == DETECTOR_STATUS_OK and obs.is_candidate
         }
         # Multi-label fusion: survivors are the candidates that clear their
         # per-fault emission floor (DECISION_CONFIRM_MIN_CONFIDENCE) and are
         # not removed by a surviving higher-precedence active suppressor
-        # (DECISION_SUPPRESSION_MAP + relative margin).
+        # (_pair_should_suppress: DECISION_SUPPRESSION_RULES relation class +
+        # relative margin, reading the two observations' metrics).
         faults = resolve_active_faults(candidates)
         survivor_names = {fault.fault_type for fault in faults}
 
@@ -699,5 +825,6 @@ class DecisionEngine:
             is_candidate,
             confidence,
             reason=getattr(result, "reason", None),
+            metrics=_extract_detector_metrics(name, result),
         )
 

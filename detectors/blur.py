@@ -22,6 +22,7 @@ class BlurResult:
     sharpness: float       # raw score: Laplacian variance
     confidence: float      # normalized 0-1 score
     is_candidate: bool     # single-frame flag; temporal confirmation happens upstream
+    sharpness_ratio: float = 1.0  # sharpness / baseline sharpness; 1.0 = unchanged
 
 
 def compute_sharpness(frame: np.ndarray) -> float:
@@ -52,4 +53,5 @@ def evaluate(frame: np.ndarray, baseline_sharpness: float) -> BlurResult:
         sharpness=sharpness,
         confidence=confidence,
         is_candidate=is_candidate,
+        sharpness_ratio=sharpness_ratio,
     )

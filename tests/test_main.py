@@ -52,9 +52,15 @@ def _frame() -> np.ndarray:
 
 
 class _Result:
-    def __init__(self, is_candidate: bool, confidence: float = 1.0) -> None:
+    def __init__(self, is_candidate: bool, confidence: float = 1.0, **metrics: float) -> None:
         self.is_candidate = is_candidate
         self.confidence = confidence
+        # Raw measurands (e.g. total_loss_fraction, sharpness_ratio) so
+        # _extract_detector_metrics can populate DetectorObservation.metrics
+        # and the conditional co-occurrence predicates can read them (same
+        # pattern as test_decision_engine._Result).
+        for field, value in metrics.items():
+            setattr(self, field, value)
 
 
 class _Detector:
@@ -434,18 +440,25 @@ def test_worker_annotates_each_event_with_its_own_fault(tmp_path: Path, monkeypa
     # not the frame's fused primary (regression: every snapshot used to show
     # the same fused label).
     #
-    # Multi-label fusion: suppressed candidates no longer register positive
-    # samples in their own confirmation trackers, and the blur execution gate
-    # (blur >= 0.9, DECISION_GATE_CONFIDENCE_BY_GATE) skips the unmeasurable
-    # tilt detector on severely blurred frames. The three faults therefore
-    # confirm in three separate windows:
-    # - tampering (frames 1-3): blur fires at frame 3 but is causally
-    #   suppressed by tampering; tilt is skipped by the blur gate;
-    # - blur (frames 5-7): tampering fires at frame 7 below its emission
-    #   floor, so it stays a secondary symptom in blur's banner;
+    # Scripted physical narrative. The mocks carry the raw measurands the real
+    # detectors expose, so the conditional co-occurrence predicates actually
+    # run end-to-end (metrics -> _pair_should_suppress -> suppression ->
+    # tracker credit) instead of falling back to "unverifiable -> co-survive":
+    # - tampering (frames 1-3): a large obstruction (total_loss_fraction 0.9)
+    #   causally explains the simultaneous severe sharpness loss at frame 3
+    #   (sharpness_ratio 0.05; the tampering->blur area-conservation predicate
+    #   holds), so tampering suppresses blur there and blur gets no tracker
+    #   credit; tilt is skipped by the blur execution gate (blur 0.9 >= 0.9).
+    #   Tampering confirms on frame 3.
+    # - blur (frames 5-7): with frame 3 not crediting, blur confirms on frame
+    #   7 (3 of the 6 observed window frames at/above its floor), where
+    #   tampering fires at 0.1 below its emission floor, so it stays a
+    #   secondary symptom in blur's banner; tilt is again skipped by the blur
+    #   gate.
     # - tilt (frames 11-13): blur fires at frame 13 just below its gate floor
-    #   (0.8 < 0.9) so tilt remains measurable, and blur is causally
-    #   suppressed by tilt; tampering fires below its floor.
+    #   (0.8 < 0.9) so tilt remains measurable, and tilt suppresses blur via
+    #   the always-margin relation (0.7 * DECISION_SUPPRESSION_MARGIN >= 0.8);
+    #   tampering fires below its emission floor.
     # On every confirmation frame the other detectors still fire as
     # candidates, so the per-event secondary/suppressed banner lists below
     # are exercised.
@@ -481,25 +494,32 @@ def test_worker_annotates_each_event_with_its_own_fault(tmp_path: Path, monkeypa
     _inject_frames(monkeypatch, frames)
     dets = {
         "tampering": _ScriptedDetector({
-            1: _Result(True, 0.8),  # >= gate: the physical cause
-            2: _Result(True, 0.8),
-            3: _Result(True, 0.8),
-            7: _Result(True, 0.1),  # below gate: secondary candidate, no suppression
-            13: _Result(True, 0.1),
+            # Real obstruction: a large lost-structure area (total_loss_fraction)
+            # that the conditional tampering->blur predicate reads to decide
+            # whether the obstruction causally explains a simultaneous blur signal.
+            1: _Result(True, 0.8, meaningful_block_fraction=0.9, total_loss_fraction=0.9),
+            2: _Result(True, 0.8, meaningful_block_fraction=0.9, total_loss_fraction=0.9),
+            3: _Result(True, 0.8, meaningful_block_fraction=0.9, total_loss_fraction=0.9),
+            7: _Result(True, 0.1, meaningful_block_fraction=0.9, total_loss_fraction=0.2),  # below gate: secondary candidate, no suppression
+            13: _Result(True, 0.1, meaningful_block_fraction=0.9, total_loss_fraction=0.2),
         }),
         "blur": _ScriptedDetector({
-            3: _Result(True, 0.9),  # suppressed by tampering -> no tracker credit
-            5: _Result(True, 0.9),
-            6: _Result(True, 0.9),
-            7: _Result(True, 0.9),
-            13: _Result(True, 0.8),  # below blur gate floor (0.9): tilt measurable; suppressed by tilt -> no tracker credit
+            # sharpness_ratio is the retention ratio (1.0 = unchanged). Frame 3's
+            # near-full obstruction (loss 0.9) conservatively explains the severe
+            # sharpness loss (1 - 0.05 = 0.95 <= 0.9 + TAMPERING_BLUR_AREA_SLACK)
+            # so the predicate suppresses blur -> no tracker credit.
+            3: _Result(True, 0.9, sharpness=150.0, sharpness_ratio=0.05),
+            5: _Result(True, 0.9, sharpness=450.0, sharpness_ratio=0.12),
+            6: _Result(True, 0.9, sharpness=450.0, sharpness_ratio=0.12),
+            7: _Result(True, 0.9, sharpness=450.0, sharpness_ratio=0.12),
+            13: _Result(True, 0.8, sharpness=600.0, sharpness_ratio=0.25),  # below blur gate floor (0.9): tilt measurable; suppressed by tilt -> no tracker credit
         }),
         "tilt": _ScriptedDetector({
-            3: _Result(True, 0.7),  # skipped by blur gate (blur 0.9) -> no tracker credit
-            7: _Result(True, 0.1),  # below gate: secondary candidate, no suppression
-            11: _Result(True, 0.7),
-            12: _Result(True, 0.7),
-            13: _Result(True, 0.7),
+            3: _Result(True, 0.7, median_shift_ratio=0.05, match_count=150),  # skipped by blur gate (blur 0.9 >= 0.9) -> no tracker credit
+            7: _Result(True, 0.1, median_shift_ratio=0.01, match_count=40),  # unreachable while the blur gate (>= 0.9) skips tilt at frame 7
+            11: _Result(True, 0.7, median_shift_ratio=0.05, match_count=150),
+            12: _Result(True, 0.7, median_shift_ratio=0.05, match_count=150),
+            13: _Result(True, 0.7, median_shift_ratio=0.05, match_count=150),
         }),
         "low_light": _Detector(_Result(False, 0.0)),
     }
@@ -554,7 +574,7 @@ def test_worker_annotates_each_event_with_its_own_fault(tmp_path: Path, monkeypa
     # Secondary/suppressed lists are relative to each event's detector.
     assert banner["tampering"][2] == ()                     # secondary
     assert banner["tampering"][3] == ("blur",)              # suppressed (tilt was gated/skipped)
-    assert banner["blur"][2] == ("tampering",)              # secondary (tilt was gated/skipped)
+    assert banner["blur"][2] == ("tampering",)              # secondary (tampering fires below its floor at frame 7; tilt gated/skipped)
     assert banner["blur"][3] == ()
     assert banner["tilt"][2] == ("tampering",)              # secondary
     assert banner["tilt"][3] == ("blur",)                   # suppressed

@@ -396,6 +396,53 @@ def test_annotate_frame_stacks_multiple_active_faults() -> None:
     assert frame.sum() == 0  # the input frame is untouched
 
 
+def test_annotate_frame_stacks_four_faults_within_frame() -> None:
+    # Multi-label can in theory carry all four faults at once. The renderer
+    # advances each stacked label by the *measured* height of the previous
+    # line, so 3-4 labels must stack without overlap and stay inside a
+    # realistic frame (regression guard: the dynamic Y-offset loop is generic,
+    # not a two-line special case).
+    faults = (
+        Fault("tampering", 0.85),
+        Fault("low_light", 0.70),
+        Fault("tilt", 0.65),
+        Fault("blur", 0.60),
+    )
+    lines = build_annotation_lines(
+        "tampering",
+        0.85,
+        faults=faults,
+        suppressed_faults=("low_light", "blur"),
+        video_time_s=1.5,
+    )
+    assert lines == [
+        "FAULT: tampering (conf=0.85)",
+        "FAULT: low_light (conf=0.70)",
+        "FAULT: tilt (conf=0.65)",
+        "FAULT: blur (conf=0.60)",
+        "suppressed: low_light, blur",
+        "t=1.50s",
+    ]
+
+    # 240x360 is a small (low-res security) frame. The whole 4-label stack
+    # with its summary lines measures ~215px from the top, so nothing may
+    # overflow into the bottom rows of the frame.
+    frame = np.zeros((240, 360, 3), dtype=np.uint8)
+    annotated = annotate_frame(
+        frame,
+        "tampering",
+        0.85,
+        faults=faults,
+        suppressed_faults=("low_light", "blur"),
+        video_time_s=1.5,
+    )
+    assert annotated.shape == frame.shape
+    assert annotated.dtype == frame.dtype
+    assert frame.sum() == 0            # the input frame is untouched
+    assert annotated[:210].sum() > 0   # labels were drawn in the top band
+    assert annotated[210:].sum() == 0  # and none ran off the bottom of the frame
+
+
 def test_save_annotated_frame_writes_snapshot(tmp_path: Path) -> None:
     frame = np.zeros((32, 32, 3), dtype=np.uint8)
     out_path = save_annotated_frame(

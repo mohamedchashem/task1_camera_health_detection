@@ -43,9 +43,13 @@ Stream 2 ─► Reader Sub-thread ─► Bounded Queue ────────�
 
 The `DecisionEngine` consolidates per-frame detector outputs into a fused decision per stream:
 
-- **Fault precedence and suppression** — candidate faults are ranked according to a precedence order. A suppression map encodes causal relationships (e.g., a high-level fault can explain and suppress lower-level symptoms), preventing symptomatic faults from being reported independently of their root cause. A suppressor requires a minimum confidence floor and must clear a relative margin over the suppressed fault's confidence, so weak noise cannot override a strong signal.
+- **Fault precedence and multi-label suppression** — candidate faults are ranked according to `DECISION_PRECEDENCE`. Each ordered (suppressor, suppressed) pair carries an explicit relation class in `DECISION_SUPPRESSION_RULES`:
+  - `always` — a deterministic physical link: the suppressor's signal fully explains the suppressed one, so suppression is unconditional once the margin check passes (e.g. tilt → blur: rotation resampling mechanically lowers Laplacian sharpness).
+  - `conditional` — a link that exists only when the frame's own raw measurands confirm it is active: tampering → low_light and tampering → blur require the obstruction's lost-structure area to conservatively explain the observed dark/sharpness change (area conservation, with the `*_AREA_SLACK` tolerances); low_light → blur requires the frame to be near-black (`LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR`).
+  - `independent` — no physical pathway, so the faults always co-survive and never suppress each other (e.g. tampering → tilt, low_light → tilt: structure loss or darkness cannot causally explain a geometric displacement). Pairs absent from `DECISION_SUPPRESSION_RULES` are independent by default.
+  General rule: a lower-precedence fault survives alongside a higher-precedence one unless the pair is causally linked AND (for `conditional` pairs) the frame's own measurands confirm the link is active AND the suppressor clears its confidence floor (`DECISION_SUPPRESSOR_MIN_CONFIDENCE`) and a relative margin (`DECISION_SUPPRESSION_MARGIN`) over the suppressed fault's confidence, so weak noise cannot override a strong signal. The survivors are emitted as a multi-label fault list in precedence order (top survivor = `primary_fault`, the rest = `secondary_symptoms`).
 
-- **Execution gating** — detectors run in a specified order (cheap signal detectors first, expensive structural last). Rather than a single static gate threshold, each gate detector has its own confidence floor; once a gate clears, it skips downstream detectors listed under it. This reduces redundant computation on frames where certain conditions are already known.
+- **Execution gating** — detectors run in a specified order (cheap signal detectors first, expensive structural last). Rather than a single static gate threshold, each gate detector has its own confidence floor; once a gate clears, it skips downstream detectors listed under it. This reduces redundant computation on frames where certain conditions are already known. Note the distinction between the two mechanisms: `DECISION_SUPPRESSION_RULES` encodes physical cause-and-effect between co-occurring faults, while `DECISION_GATE_SKIP_MAP` is execution gating — a decision about signal reliability (a detector's output is unmeasurable under adverse conditions, e.g. keypoint matching on near-black or severely blurred frames). The two can overlap in effect but not in meaning: a gate prevents an unreliable detector from running; a suppression rule removes a confirmed symptom of a higher-precedence root cause.
 
 - **Emission gating** — a candidate frame counts toward temporal confirmation only when its confidence reaches the fault's own floor, so low-confidence noise never enters the confirmation pipeline.
 
@@ -214,6 +218,11 @@ All configuration constants are defined in `config.py`.
 | Decision | `DECISION_CONFIRM_MIN_CONFIDENCE` | `{tampering: 0.5, low_light: 0.5, blur: 0.5, tilt: 0.5}` | Per-fault min confidence to enter confirmation window |
 | Decision | `DECISION_SUPPRESSOR_MIN_CONFIDENCE` | 0.50 | Min confidence for a fault to suppress another |
 | Decision | `DECISION_SUPPRESSION_MARGIN` | 1.5 | Relative margin suppressor must clear |
+| Decision | `DECISION_SUPPRESSION_MAP` | `{...}` | Legacy single-primary suppression map: which candidates a primary fault causally explains. Used only by the legacy single-primary path (`resolve_primary_fault` / `fuse_observations`), not by the multi-label path |
+| Decision | `DECISION_SUPPRESSION_RULES` | `{...}` | Per-pair relation classes for multi-label suppression (`always` / `conditional` / `independent`); pairs absent from the map are `independent` (never suppress) |
+| Decision | `TAMPERING_LOW_LIGHT_AREA_SLACK` | 0.20 | Slack for the tampering→low_light area-conservation predicate (extent mismatch tolerated between obstruction area and dark region) |
+| Decision | `TAMPERING_BLUR_AREA_SLACK` | 0.20 | Slack for the tampering→blur area-conservation predicate (extent mismatch tolerated between obstruction area and lost-sharpness area) |
+| Decision | `LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR` | 0.80 | Confidence floor at which low_light is treated as near-black for the low_light→blur predicate (alias of `DECISION_GATE_CONFIDENCE`) |
 | Decision | `DECISION_CONFIRMATION_WINDOW_SECONDS` | 3.0 | Temporal confirmation window length |
 | Decision | `DECISION_CONFIRMATION_MIN_POSITIVE_RATIO` | 0.50 | Fraction of positive frames required to confirm |
 | Decision | `DECISION_CONFIRMATION_MIN_WINDOW_FRAMES` | 3 | Minimum frames observed in window |
@@ -224,6 +233,8 @@ All configuration constants are defined in `config.py`.
 | Persistence | `LOG_MAX_BYTES` | 10 MB | Log file rotation threshold |
 | Persistence | `SNAPSHOT_MAX_TOTAL` | 200 | Annotated snapshot buffer capacity |
 | Baseline | `BASELINE_CAPTURE_SECONDS` | 3.0 | Baseline capture window duration |
+
+**Predicate-parameter provenance:** The multi-fault predicate constants (`TAMPERING_LOW_LIGHT_AREA_SLACK`, `TAMPERING_BLUR_AREA_SLACK`, `LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR`) are camera-agnostic reasoned starting points, not derived from any specific footage, and have not yet been validated against a broader real-footage dataset — consistent with the open items listed in Appendix D (Validation Status).
 
 **Design rationale:** The bounded frame queue with drop-oldest eviction limits memory consumption and bounds end-to-end latency under slow or degraded feeds. Reconnect backoff timers protect recovering streams from connection storms. Log and snapshot retention limits prevent unbounded disk growth during extended deployments.
 

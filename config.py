@@ -336,6 +336,37 @@ DECISION_SUPPRESSION_MAP = {
     "blur": set(),
 }
 
+# Per-pair relation classes for the multi-fault co-occurrence layer (Phase N).
+# This declarative structure is the intended successor to the flat
+# DECISION_SUPPRESSION_MAP above: instead of an implicit "always suppress"
+# set, each ordered (primary, secondary) fault pair carries an explicit
+# relation class. Nothing consumes it yet -- DECISION_SUPPRESSION_MAP remains
+# the live input for the current fusion engine, so this block is inert until
+# a later subtask wires it in.
+#
+# Relation classes:
+#   "always"      -- the primary's signal fully explains the secondary's; no
+#                    residual measurement can contradict the suppression, so
+#                    suppression is unconditional.
+#   "conditional" -- the primary can explain the secondary, but only when a
+#                    measurable predicate (area conservation, near-black
+#                    floor, ...) holds on the raw metrics; fusion must run
+#                    that predicate before suppressing.
+#   "independent" -- no physical causal pathway; the two faults can co-occur
+#                    and must never suppress each other.
+#
+# Keys are ordered (suppressor, suppressed) in DECISION_PRECEDENCE order.
+DECISION_SUPPRESSION_RULES = {
+    ("tilt", "blur"): "always",
+    ("tampering", "low_light"): "conditional",
+    ("tampering", "blur"): "conditional",
+    ("low_light", "blur"): "conditional",
+    # tampering->tilt and low_light->tilt intentionally absent (independent,
+    # no physical pathway): tilt is a geometric displacement, not a
+    # brightness/structure-loss symptom, so neither tampering nor low-light
+    # can causally explain it.
+}
+
 # A suppressor must reach this confidence before it can override a
 # lower-priority fault in precedence disputes. Detector confidences are
 # not cross-normalized, so this prevents a weak signal from dominating.
@@ -402,6 +433,34 @@ DECISION_GATE_SKIP_MAP = {
     "low_light": ("tampering", "tilt"),
     "blur": ("tilt",),
 }
+
+# --- Multi-fault co-occurrence predicates (Phase N) --------------------------
+# Parameters for the "conditional" relations declared in
+# DECISION_SUPPRESSION_RULES. Empirical, camera-agnostic starting points --
+# not derived from any specific clip. Nothing consumes these yet; the
+# predicate functions land in a later subtask.
+
+TAMPERING_LOW_LIGHT_AREA_SLACK = 0.2
+# Slack margin for the tampering-vs-low-light area-conservation check. The
+# obstruction area (structure-loss blocks) and the dark region (dark pixels)
+# are measured on different grids, so their extents never match exactly even
+# when both signals come from the same event; this fraction absorbs that
+# measurement mismatch without accepting wholesale overlap. In [0, 1].
+# Empirical starting point.
+
+TAMPERING_BLUR_AREA_SLACK = 0.2
+# Same slack margin for the tampering-vs-blur area-conservation check:
+# obstruction is localized while blur is global, so the check compares the
+# obstruction's lost-structure area against the blurred area and tolerates
+# only this much mismatch. In [0, 1]. Empirical starting point.
+
+LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR = DECISION_GATE_CONFIDENCE
+# Floor at which low-light is treated as "near-black" for the low_light->blur
+# relation: at or above the existing low-light gate floor the whole frame is
+# unmeasurable, so low-light fully explains any blur signal and no area check
+# is meaningful on a black frame. Alias of DECISION_GATE_CONFIDENCE (the
+# existing near-black/gate floor) rather than a duplicated number, so tuning
+# the gate floor propagates here automatically.
 
 # Temporal confirmation window (time-based, matches BASELINE_CAPTURE_SECONDS).
 DECISION_CONFIRMATION_WINDOW_SECONDS = 3.0
@@ -665,6 +724,44 @@ def validate_config() -> None:
             f"DECISION_SUPPRESSION_MAP[{suppressor!r}] must reference known fault types "
             f"other than itself; got {sorted(suppressed)}.",
         )
+
+    # Multi-fault co-occurrence rules (Phase N)
+    _FAULT_TYPES = set(DECISION_PRECEDENCE)
+    _RELATION_CLASSES = {"always", "conditional", "independent"}
+    for pair, relation in DECISION_SUPPRESSION_RULES.items():
+        require(
+            isinstance(pair, tuple)
+            and len(pair) == 2
+            and pair[0] in _FAULT_TYPES
+            and pair[1] in _FAULT_TYPES
+            and pair[0] != pair[1],
+            f"DECISION_SUPPRESSION_RULES key {pair!r} must be a tuple of two "
+            f"distinct fault types from {sorted(_FAULT_TYPES)}.",
+        )
+        require(
+            DECISION_PRECEDENCE.index(pair[0]) < DECISION_PRECEDENCE.index(pair[1]),
+            f"DECISION_SUPPRESSION_RULES key {pair!r} must be ordered "
+            f"(suppressor, suppressed) by DECISION_PRECEDENCE.",
+        )
+        require(
+            relation in _RELATION_CLASSES,
+            f"DECISION_SUPPRESSION_RULES[{pair!r}] must be one of "
+            f"{sorted(_RELATION_CLASSES)}; got {relation!r}.",
+        )
+    require(
+        0 <= TAMPERING_LOW_LIGHT_AREA_SLACK <= 1,
+        f"TAMPERING_LOW_LIGHT_AREA_SLACK must be in [0, 1]; "
+        f"got {TAMPERING_LOW_LIGHT_AREA_SLACK}.",
+    )
+    require(
+        0 <= TAMPERING_BLUR_AREA_SLACK <= 1,
+        f"TAMPERING_BLUR_AREA_SLACK must be in [0, 1]; got {TAMPERING_BLUR_AREA_SLACK}.",
+    )
+    require(
+        0 < LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR <= 1,
+        f"LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR must be in (0, 1]; "
+        f"got {LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR}.",
+    )
     require(
         0 <= DECISION_SUPPRESSOR_MIN_CONFIDENCE <= 1,
         f"DECISION_SUPPRESSOR_MIN_CONFIDENCE must be in [0, 1]; got {DECISION_SUPPRESSOR_MIN_CONFIDENCE}.",

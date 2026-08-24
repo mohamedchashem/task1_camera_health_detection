@@ -37,6 +37,8 @@ class TamperingResult:
     confidence: float                         # normalized 0-1 score
     is_candidate: bool                         # single-frame flag; temporal confirmation happens upstream
     reason: str | None = None                  # optional diagnostic ("degraded_baseline", ...)
+    meaningful_block_fraction: float = 0.0     # baseline grid coverage of usable structure, 0-1
+    total_loss_fraction: float = 0.0           # fraction of meaningful baseline blocks that lost structure, 0-1
 
 
 def compute_edge_map(frame: np.ndarray) -> np.ndarray:
@@ -162,12 +164,14 @@ def evaluate(frame: np.ndarray, baseline_edges: np.ndarray) -> TamperingResult:
     # rather than real obstruction. Refuse to emit candidates (never a false
     # tampering event) until a usable baseline is captured. The decision
     # engine surfaces this as the detector's "reason".
-    if meaningful_block_fraction(baseline_edges) < TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION:
+    baseline_meaningful_fraction = meaningful_block_fraction(baseline_edges)
+    if baseline_meaningful_fraction < TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION:
         return TamperingResult(
             largest_contiguous_loss_fraction=0.0,
             confidence=0.0,
             is_candidate=False,
             reason="degraded_baseline",
+            meaningful_block_fraction=baseline_meaningful_fraction,
         )
 
     current_edges = compute_edge_map(frame)
@@ -199,4 +203,6 @@ def evaluate(frame: np.ndarray, baseline_edges: np.ndarray) -> TamperingResult:
         largest_contiguous_loss_fraction=largest_fraction,
         confidence=confidence,
         is_candidate=is_candidate,
+        meaningful_block_fraction=baseline_meaningful_fraction,
+        total_loss_fraction=total_fraction,
     )

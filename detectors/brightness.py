@@ -15,6 +15,7 @@ class BrightnessResult:
     dark_pixel_ratio: float  # raw score
     confidence: float        # normalized 0-1 score
     is_candidate: bool       # single-frame flag; temporal confirmation happens upstream
+    relative_increase: float = 0.0  # (current_ratio - baseline) / baseline
 
 
 def compute_dark_pixel_ratio(frame: np.ndarray) -> float:
@@ -40,4 +41,5 @@ def evaluate(frame: np.ndarray, baseline_dark_ratio: float) -> BrightnessResult:
         dark_pixel_ratio=current_ratio,
         confidence=confidence,
         is_candidate=is_candidate,
+        relative_increase=relative_increase,
     )

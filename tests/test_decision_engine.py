@@ -52,9 +52,14 @@ def _obs(
 
 
 class _Result:
-    def __init__(self, is_candidate: bool, confidence: float = 1.0) -> None:
+    def __init__(self, is_candidate: bool, confidence: float = 1.0, **metrics: float) -> None:
         self.is_candidate = is_candidate
         self.confidence = confidence
+        # Raw measurands (e.g. total_loss_fraction, sharpness_ratio) so
+        # _extract_detector_metrics can populate DetectorObservation.metrics
+        # and the co-occurrence predicates can read them.
+        for field, value in metrics.items():
+            setattr(self, field, value)
 
 
 class _Detector:
@@ -250,14 +255,20 @@ def test_single_fault_no_regression() -> None:
 
 
 def test_suppression_still_works() -> None:
-    # tampering causally explains low_light (DECISION_SUPPRESSION_MAP) and
-    # clears the relative margin (0.85 * MARGIN >= 0.75): low_light must be
-    # removed from the survivor list, exactly as V1 suppressed it.
+    # The tampering->low_light conditional predicate now decides: the relative
+    # margin clears (0.85 * MARGIN >= 0.75) AND the dark region is
+    # conservatively explained by the obstruction area (relative_increase
+    # <= total_loss_fraction + TAMPERING_LOW_LIGHT_AREA_SLACK), so low_light
+    # is removed from the survivor list exactly as V1 suppressed it.
     engine = DecisionEngine(
         "cam1",
         {
-            "tampering": _Detector(result=_Result(is_candidate=True, confidence=0.85)),
-            "low_light": _Detector(result=_Result(is_candidate=True, confidence=0.75)),
+            "tampering": _Detector(
+                result=_Result(is_candidate=True, confidence=0.85, total_loss_fraction=0.9)
+            ),
+            "low_light": _Detector(
+                result=_Result(is_candidate=True, confidence=0.75, relative_increase=0.3)
+            ),
         },
     )
     result = engine.process_frame(_frame(), 0, 0.0)
@@ -268,11 +279,10 @@ def test_suppression_still_works() -> None:
 
 
 def test_multi_fault_independent() -> None:
-    # Multi-label happy path. DECISION_SUPPRESSION_MAP causally explains
-    # every fault pair, so two faults can coexist only when an active
-    # suppressor fails the relative margin against a stronger signal:
-    # tampering 0.5 * DECISION_SUPPRESSION_MARGIN (0.75) < tilt 0.9, so tilt
-    # is NOT suppressed and both faults are reported in precedence order.
+    # Multi-label happy path: tampering->tilt is intentionally absent from
+    # DECISION_SUPPRESSION_RULES (independent -- no physical pathway from
+    # structure loss to geometric displacement), so the two faults always
+    # co-survive once each clears its emission floor.
     engine = DecisionEngine(
         "cam1",
         {
@@ -287,6 +297,148 @@ def test_multi_fault_independent() -> None:
     )
     assert result.primary_fault == "tampering"
     assert {fault.fault_type for fault in result.faults} == {"tampering", "tilt"}
+
+
+
+def test_tampering_and_tilt_co_survive_when_independent() -> None:
+    # tampering->tilt is intentionally absent from DECISION_SUPPRESSION_RULES
+    # (no physical pathway: obstruction is a structure-loss symptom, tilt is a
+    # geometric displacement), so the pair is independent: both faults always
+    # co-survive once each clears its emission floor -- here even though the
+    # suppressor gate and relative margin are both met (0.9 >= GATE, 0.9 *
+    # MARGIN = 1.35 >= 0.8).
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "tampering": _Detector(
+                result=_Result(is_candidate=True, confidence=0.9, total_loss_fraction=0.9)
+            ),
+            "tilt": _Detector(result=_Result(is_candidate=True, confidence=0.8)),
+        },
+    )
+    result = engine.process_frame(_frame(), 0, 0.0)
+    assert [fault.fault_type for fault in result.faults] == ["tampering", "tilt"]
+    assert result.suppressed_faults == ()
+
+
+def test_low_light_and_tilt_co_survive_when_independent() -> None:
+    # low_light->tilt is likewise absent from DECISION_SUPPRESSION_RULES:
+    # darkness cannot causally explain a geometric displacement, so the two
+    # always co-survive. low_light stays below its gate floor so tilt is not
+    # skipped; the predicate's independence decision still wins over the met
+    # margin (0.75 * MARGIN = 1.125 >= 0.8).
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "low_light": _Detector(
+                result=_Result(is_candidate=True, confidence=0.75, dark_pixel_ratio=0.99)
+            ),
+            "tilt": _Detector(result=_Result(is_candidate=True, confidence=0.8)),
+        },
+    )
+    result = engine.process_frame(_frame(), 0, 0.0)
+    assert [fault.fault_type for fault in result.faults] == ["low_light", "tilt"]
+    assert result.suppressed_faults == ()
+
+
+def test_tampering_low_light_co_survive_when_area_not_conserved() -> None:
+    # The conditional tampering->low_light predicate: the margin clears
+    # (0.9 * MARGIN >= 0.6) but the dark region is far larger than the
+    # obstruction area can explain (relative_increase 0.9 > total_loss_fraction
+    # 0.3 + TAMPERING_LOW_LIGHT_AREA_SLACK), so low_light is NOT a symptom of
+    # tampering and both faults genuinely co-occur.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "tampering": _Detector(
+                result=_Result(is_candidate=True, confidence=0.9, total_loss_fraction=0.3)
+            ),
+            "low_light": _Detector(
+                result=_Result(is_candidate=True, confidence=0.6, relative_increase=0.9)
+            ),
+        },
+    )
+    result = engine.process_frame(_frame(), 0, 0.0)
+    assert [fault.fault_type for fault in result.faults] == ["tampering", "low_light"]
+    assert result.suppressed_faults == ()
+
+
+def test_tampering_blur_co_survive_when_area_not_conserved() -> None:
+    # The conditional tampering->blur predicate: the obstruction's 0.3 lost
+    # structure cannot explain blur's 0.8 sharpness loss (sharpness_ratio 0.2
+    # -> 1 - 0.2 = 0.8 > 0.3 + TAMPERING_BLUR_AREA_SLACK), so blur survives
+    # as an independent fault alongside tampering.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "tampering": _Detector(
+                result=_Result(is_candidate=True, confidence=0.9, total_loss_fraction=0.3)
+            ),
+            "blur": _Detector(
+                result=_Result(is_candidate=True, confidence=0.6, sharpness_ratio=0.2)
+            ),
+        },
+    )
+    result = engine.process_frame(_frame(), 0, 0.0)
+    assert [fault.fault_type for fault in result.faults] == ["tampering", "blur"]
+    assert result.suppressed_faults == ()
+
+
+def test_low_light_blur_co_survive_when_not_near_black() -> None:
+    # The conditional low_light->blur predicate: below the near-black floor a
+    # dim-but-measurable scene cannot explain the blur signal, so both faults
+    # survive even though the relative margin is met (0.6 * MARGIN = 0.9
+    # >= 0.5).
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "low_light": _Detector(
+                result=_Result(is_candidate=True, confidence=0.6, dark_pixel_ratio=0.8)
+            ),
+            "blur": _Detector(result=_Result(is_candidate=True, confidence=0.5)),
+        },
+    )
+    result = engine.process_frame(_frame(), 0, 0.0)
+    assert [fault.fault_type for fault in result.faults] == ["low_light", "blur"]
+    assert result.suppressed_faults == ()
+
+
+def test_tilt_suppresses_blur_always_relation_unchanged() -> None:
+    # tilt->blur stays the "always" relation: the margin alone decides and raw
+    # metrics are irrelevant. tilt 0.8 clears the margin against blur 0.6
+    # (0.8 * MARGIN = 1.2 >= 0.6), so blur is suppressed exactly as before.
+    # blur stays below its own gate floor (0.9) so tilt is not skipped.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "tilt": _Detector(result=_Result(is_candidate=True, confidence=0.8)),
+            "blur": _Detector(
+                result=_Result(is_candidate=True, confidence=0.6, sharpness_ratio=0.1)
+            ),
+        },
+    )
+    result = engine.process_frame(_frame(), 0, 0.0)
+    assert [fault.fault_type for fault in result.faults] == ["tilt"]
+    assert result.suppressed_faults == ("blur",)
+
+
+def test_low_light_suppresses_blur_when_near_black() -> None:
+    # At/above the near-black floor (LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR) the whole
+    # frame is unmeasurable, so low_light fully explains any blur signal: the
+    # conditional predicate passes and blur is suppressed.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "low_light": _Detector(
+                result=_Result(is_candidate=True, confidence=0.85, dark_pixel_ratio=0.99)
+            ),
+            "blur": _Detector(result=_Result(is_candidate=True, confidence=0.5)),
+        },
+    )
+    result = engine.process_frame(_frame(), 0, 0.0)
+    assert [fault.fault_type for fault in result.faults] == ["low_light"]
+    assert result.suppressed_faults == ("blur",)
+
 
 # --- 2. Confidence gating --------------------------------------------------
 

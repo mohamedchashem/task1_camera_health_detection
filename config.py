@@ -97,18 +97,6 @@ TAMPERING_MIN_CONTIGUOUS_BLOCK_FRACTION = 0.15
 # region; blur and low-light degrade structure scattered across the
 # whole frame, so they should not form one large contiguous cluster.
 
-TAMPERING_MAX_GLOBAL_LOSS_FRACTION = 0.75
-# Guard against global (non-localized) structure loss masquerading as
-# obstruction. Real obstruction is localized: the largest lost cluster
-# covers part of the lens while the rest of the scene keeps its
-# structure, so the TOTAL disappeared fraction of meaningful blocks
-# stays well below 1. Blur, low-light, and rotation resampling remove
-# edges nearly everywhere, so the disappeared mask becomes one giant
-# cluster covering most of the frame. This ceiling rejects those
-# global-degradation cases (a real obstruction covering up to ~75% of
-# meaningful structure still passes). Empirical starting point, not
-# tuned to any specific footage.
-
 TAMPERING_MIN_COMPACTNESS_RATIO = 0.6
 # A tampering candidate must also have its single largest lost cluster
 # account for at least this fraction of ALL lost structure. This
@@ -156,6 +144,45 @@ TAMPERING_BASELINE_EDGE_PERSISTENCE_RATIO = 0.5
 # an edge for it to count as stable baseline structure, rather than
 # frame-to-frame noise. Reasoned starting point, not tuned to any
 # specific footage — applies identically to any camera/baseline window.
+
+# --- Approach A: relative ambient-retention obstruction model (current) -----
+# Implemented in detectors/tampering.py and live in production: the scoring
+# functions (estimate_ambient_retention, _obstruction_mask,
+# assess_obstruction_candidacy) are wired into evaluate(). The constants
+# below are the relative, footage-invariant ratios the model is built on:
+# they compare
+# blocks WITHIN a single frame against that frame's OWN current retention
+# level, so their values are dimensionless and cannot drift with camera
+# exposure, resolution, or scene texture. Their specific numeric values are
+# empirical starting points pending real calibration — consistent with how
+# the project documents every other unvalidated constant.
+
+TAMPERING_AMBIENT_RETENTION_QUANTILE = 0.90
+# Upper-tail quantile (0-1) of the per-block retention ratios (current edge
+# density / baseline edge density) used to estimate the frame's ambient
+# retention level. The upper tail (not the mean/median) is deliberate: the
+# obstruction itself sits in the lower tail, so the estimate stays at the
+# true ambient level even when an obstruction covers most of the frame —
+# valid while obstruction coverage stays below (1 - quantile), ~90% here.
+# Relative by construction; empirical starting point.
+
+TAMPERING_OBSTRUCTION_DEPTH_RATIO = 0.35
+# A block is an obstruction block when its retention ratio is at most this
+# fraction ("k" in the approved plan) of the frame's ambient retention.
+# Because it is a comparison to the frame's OWN current state, a real
+# obstruction stays a relative outlier even when co-occurring blur collapses
+# the ambient level — and pure global degradation flags nothing, since every
+# block sits AT the ambient level itself. Relative by construction; empirical
+# starting point pending real calibration.
+
+TAMPERING_AMBIENT_MIN_RETENTION = 0.1
+# Absolute degeneracy floor — the ONE non-relative constant in this model,
+# deliberately and explicitly. The relative comparison is only meaningful
+# when the frame demonstrably retains structure somewhere: below this
+# ambient level the whole frame has collapsed to near-zero structure, any
+# obstruction claim is fully ambiguous, and the model must NOT confidently
+# emit a candidate (that ambiguous case belongs to Approach C in a later
+# subtask). Empirical starting point, pending real calibration.
 
 # --- Blur/dirty-lens detector --------------------------------------------
 # Detects loss of image sharpness (out-of-focus, smudged/dirty lens) via
@@ -336,13 +363,14 @@ DECISION_SUPPRESSION_MAP = {
     "blur": set(),
 }
 
-# Per-pair relation classes for the multi-fault co-occurrence layer (Phase N).
-# This declarative structure is the intended successor to the flat
-# DECISION_SUPPRESSION_MAP above: instead of an implicit "always suppress"
-# set, each ordered (primary, secondary) fault pair carries an explicit
-# relation class. Nothing consumes it yet -- DECISION_SUPPRESSION_MAP remains
-# the live input for the current fusion engine, so this block is inert until
-# a later subtask wires it in.
+# Per-pair relation classes for the multi-fault co-occurrence layer.
+# This declarative structure is the LIVE input for the current multi-label
+# fusion engine (pipeline/decision_engine.py consumes it directly): instead
+# of the flat DECISION_SUPPRESSION_MAP above, each ordered (primary,
+# secondary) fault pair carries an explicit relation class that fusion
+# resolves per frame (_pair_should_suppress / resolve_active_faults).
+# DECISION_SUPPRESSION_MAP remains consumed ONLY by the legacy test-only
+# single-primary path (resolve_primary_fault / fuse_observations).
 #
 # Relation classes:
 #   "always"      -- the primary's signal fully explains the secondary's; no
@@ -437,8 +465,9 @@ DECISION_GATE_SKIP_MAP = {
 # --- Multi-fault co-occurrence predicates (Phase N) --------------------------
 # Parameters for the "conditional" relations declared in
 # DECISION_SUPPRESSION_RULES. Empirical, camera-agnostic starting points --
-# not derived from any specific clip. Nothing consumes these yet; the
-# predicate functions land in a later subtask.
+# not derived from any specific clip. Live in production: consumed by the
+# physical predicates in pipeline/decision_engine.py (_area_conserved,
+# _is_near_black).
 
 TAMPERING_LOW_LIGHT_AREA_SLACK = 0.2
 # Slack margin for the tampering-vs-low-light area-conservation check. The
@@ -591,11 +620,6 @@ def validate_config() -> None:
         f"got {TAMPERING_MIN_CONTIGUOUS_BLOCK_FRACTION}.",
     )
     require(
-        0 < TAMPERING_MAX_GLOBAL_LOSS_FRACTION <= 1,
-        f"TAMPERING_MAX_GLOBAL_LOSS_FRACTION must be in (0, 1]; "
-        f"got {TAMPERING_MAX_GLOBAL_LOSS_FRACTION}.",
-    )
-    require(
         0 < TAMPERING_MIN_COMPACTNESS_RATIO <= 1,
         f"TAMPERING_MIN_COMPACTNESS_RATIO must be in (0, 1]; "
         f"got {TAMPERING_MIN_COMPACTNESS_RATIO}.",
@@ -609,6 +633,24 @@ def validate_config() -> None:
         0 < TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION <= 1,
         f"TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION must be in (0, 1]; "
         f"got {TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION}.",
+    )
+    # Approach A relative ambient-retention model (live: wired into
+    # detectors/tampering.py evaluate(); two relative ratios plus one
+    # absolute floor).
+    require(
+        0 < TAMPERING_AMBIENT_RETENTION_QUANTILE < 1,
+        f"TAMPERING_AMBIENT_RETENTION_QUANTILE must be in (0, 1); "
+        f"got {TAMPERING_AMBIENT_RETENTION_QUANTILE}.",
+    )
+    require(
+        0 < TAMPERING_OBSTRUCTION_DEPTH_RATIO < 1,
+        f"TAMPERING_OBSTRUCTION_DEPTH_RATIO must be in (0, 1); "
+        f"got {TAMPERING_OBSTRUCTION_DEPTH_RATIO}.",
+    )
+    require(
+        0 < TAMPERING_AMBIENT_MIN_RETENTION < 1,
+        f"TAMPERING_AMBIENT_MIN_RETENTION must be in (0, 1); "
+        f"got {TAMPERING_AMBIENT_MIN_RETENTION}.",
     )
 
     # Blur/dirty-lens detector

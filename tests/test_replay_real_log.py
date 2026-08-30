@@ -40,6 +40,7 @@ from pipeline.annotate import build_annotation_lines
 from pipeline.decision_engine import (
     DETECTOR_STATUS_OK,
     DETECTOR_STATUS_SKIPPED,
+    DETECTOR_STATUS_UNAVAILABLE,
     DetectorObservation,
     Fault,
     classify_candidates,
@@ -118,10 +119,20 @@ def _replay(record: dict) -> dict:
     survivors = ordered(classification.survivors)
     below_floor = ordered(classification.below_floor)
     suppressed = ordered(classification.suppressed)
+    # Both causes of "can't tell you right now" map to the SAME unmeasurable
+    # bucket, exactly as main.py's real banner logic does: gate-skipped
+    # detectors (status "skipped", reason "suppressed_by_gate") and detectors
+    # that ran but could not measure (status "unavailable", e.g. tampering on
+    # a degraded baseline). The two stay distinguishable in the raw log
+    # (status/reason) but never in the rendered banner.
     unmeasurable = tuple(
         name
         for name, obs in observations.items()
-        if obs.status == DETECTOR_STATUS_SKIPPED and obs.reason == "suppressed_by_gate"
+        if (
+            obs.status == DETECTOR_STATUS_SKIPPED
+            and obs.reason == "suppressed_by_gate"
+        )
+        or obs.status == DETECTOR_STATUS_UNAVAILABLE
     )
     # The log's temporal_status records which faults were temporally confirmed
     # on this frame (the tracker state was not itself persisted).
@@ -307,6 +318,52 @@ def test_replay_frame_946_gate_skip_visible_not_dropped() -> None:
     ]
     assert replay["unmeasurable"] == ("tilt",)
     _assert_exclusivity(lines)
+
+
+def test_replay_unavailable_observation_renders_unmeasurable_same_as_gate_skip() -> None:
+    # Approach C replay parity: a degraded-baseline tampering observation
+    # (status "unavailable", reason "degraded_baseline") must be classified by
+    # the replay helper into the SAME "unmeasurable" bucket as a gate-skip
+    # (status "skipped", reason "suppressed_by_gate") -- mirroring main.py's
+    # real banner logic, which feeds both causes into the one "unmeasurable:"
+    # line with no visual distinction. Constructed from a synthetic frame-log
+    # record because the preserved schema-v2 fixture predates the status.
+    def _record_for(status: str, reason: str | None) -> dict:
+        return {
+            "frame_number": 0,
+            "video_time_s": 0.0,
+            "primary_fault": None,
+            "confidence": 0.0,
+            "temporal_status": {},
+            "detectors": {
+                "blur": {
+                    "status": "ok",
+                    "is_candidate": False,
+                    "confidence": 0.1,
+                    "reason": None,
+                    "error_message": None,
+                },
+                "tampering": {
+                    "status": status,
+                    "is_candidate": False,
+                    "confidence": 0.0,
+                    "reason": reason,
+                    "error_message": None,
+                },
+            },
+        }
+
+    unavailable = _replay(_record_for(DETECTOR_STATUS_UNAVAILABLE, "degraded_baseline"))
+    assert unavailable["unmeasurable"] == ("tampering",)
+    unavailable_lines = _render(unavailable)
+    assert "unmeasurable: tampering" in unavailable_lines
+    _assert_exclusivity(unavailable_lines)
+
+    # The identical record with a gate-skip cause renders byte-for-byte the
+    # same "unmeasurable:" line -- one shared category, never two.
+    gate_skip = _replay(_record_for(DETECTOR_STATUS_SKIPPED, "suppressed_by_gate"))
+    assert gate_skip["unmeasurable"] == ("tampering",)
+    assert _render(gate_skip) == unavailable_lines
 
 
 def test_replay_frame_1096_exclusivity_on_original_contradiction() -> None:

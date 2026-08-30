@@ -51,6 +51,7 @@ from pipeline.decision_engine import (
     DETECTOR_STATUS_ERROR,
     DETECTOR_STATUS_OK,
     DETECTOR_STATUS_SKIPPED,
+    DETECTOR_STATUS_UNAVAILABLE,
     EVENT_STATUS_CONFIRMED,
     ConfirmedFault,
     DecisionEngine,
@@ -108,6 +109,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--allow-cpu-fallback",
         action="store_true",
         help="Fall back to CPU when the resolved CUDA device is unavailable.",
+    )
+    parser.add_argument(
+        "--allow-degraded-baseline",
+        action="store_true",
+        help="Start cameras whose baseline is degraded and unacknowledged anyway "
+             "(tampering detection will be inoperative for those cameras). "
+             "Bypasses the degraded-baseline safety gate.",
     )
     parser.add_argument("--log-level", choices=_LOG_LEVELS, default="INFO",
                         help="Console log level.")
@@ -283,6 +291,59 @@ def _build_detectors(
     }
 
 
+class DegradedBaselineStartupError(RuntimeError):
+    """A camera's baseline is degraded and unacknowledged, so its worker must
+    not start (the tampering detector would be permanently inoperative)."""
+
+
+def _check_baseline_degradation(
+    camera_id: str,
+    baselines_dir: str | Path,
+    *,
+    allow_degraded_baseline: bool,
+) -> None:
+    """Enforce the startup degraded-baseline gate for one camera.
+
+    The degraded condition is recomputed authoritatively from the loaded
+    baseline edge map via ``tampering.baseline_degradation_info`` — the same
+    single definition used at capture time and by the runtime tampering
+    check — rather than trusting the JSON's cached ``quality_warnings`` /
+    ``degraded_acknowledged`` text (the JSON can be stale or hand-edited).
+
+    Behavior:
+    * not degraded -> return, no log output;
+    * degraded and unacknowledged -> raise ``DegradedBaselineStartupError``
+      unless ``allow_degraded_baseline`` is set;
+    * degraded and acknowledged (or overridden) -> log a prominent startup
+      warning that tampering detection is inoperative.
+    """
+    baselines_dir = Path(baselines_dir)
+    record = _load_baseline_record(camera_id, baselines_dir)
+    edges = _load_baseline_edges(camera_id, baselines_dir)
+    fraction, is_degraded, warning_text = tampering.baseline_degradation_info(edges)
+
+    if not is_degraded:
+        return
+
+    acknowledged = bool(record.get("degraded_acknowledged"))
+    if not (acknowledged or allow_degraded_baseline):
+        raise DegradedBaselineStartupError(
+            f"camera {camera_id!r}: baseline is degraded and unacknowledged. "
+            f"{warning_text} (measured meaningful-block fraction "
+            f"{fraction:.3f}). Tampering detection is inoperative with this "
+            f"baseline. Recapture the baseline from a clean segment, "
+            f"acknowledge the degraded capture (pipeline.capture_baseline "
+            f"--acknowledge-degraded), or pass --allow-degraded-baseline to "
+            f"start anyway."
+        )
+
+    logger.warning(
+        "DEGRADED BASELINE ACKNOWLEDGED: camera %s tampering detection is "
+        "inoperative: %s (degraded_acknowledged=%s, --allow-degraded-baseline=%s)",
+        camera_id, warning_text, acknowledged, allow_degraded_baseline,
+    )
+
+
 def _make_frame_source(source: str) -> Iterable:
     """Pick the reader for a source: live RTSP streams vs local video files."""
     if _is_live_source(source):
@@ -396,6 +457,7 @@ class CameraMetrics:
         self._candidates: Counter[str] = Counter()
         self._errors: Counter[str] = Counter()
         self._skipped: Counter[str] = Counter()
+        self._unavailable: Counter[str] = Counter()
         self._events_persisted = 0
         self._total_events_persisted = 0
 
@@ -418,7 +480,7 @@ class CameraMetrics:
             self._total_dropped += 1
 
     def record_observations(self, decision: DecisionFrame) -> None:
-        """Tally per-detector candidate/error/skipped statuses."""
+        """Tally per-detector candidate/error/skipped/unavailable statuses."""
         with self._lock:
             for obs in decision.detectors:
                 if obs.status == DETECTOR_STATUS_OK and obs.is_candidate:
@@ -427,6 +489,8 @@ class CameraMetrics:
                     self._errors[obs.detector] += 1
                 elif obs.status == DETECTOR_STATUS_SKIPPED:
                     self._skipped[obs.detector] += 1
+                elif obs.status == DETECTOR_STATUS_UNAVAILABLE:
+                    self._unavailable[obs.detector] += 1
 
     def record_event_persisted(self) -> None:
         with self._lock:
@@ -463,6 +527,7 @@ class CameraMetrics:
                 "candidate_counts": dict(self._candidates),
                 "error_counts": dict(self._errors),
                 "skipped_counts": dict(self._skipped),
+                "unavailable_counts": dict(self._unavailable),
                 "events_persisted": self._events_persisted,
                 "total_processed": self._total_processed,
                 "total_dropped": self._total_dropped,
@@ -476,6 +541,7 @@ class CameraMetrics:
             self._candidates.clear()
             self._errors.clear()
             self._skipped.clear()
+            self._unavailable.clear()
             self._events_persisted = 0
             return record
 
@@ -802,15 +868,23 @@ class CameraWorker(threading.Thread):
             for fault in decision.faults
             if fault.fault_type not in confirmed_types
         )
-        # Gate-skipped detectors this frame (status "skipped", reason
-        # "suppressed_by_gate"). Passed in FULL -- including fault types that
-        # are also confirmed -- annotate.py's exclusivity logic renders the
-        # overlap as a [unmeasurable] marker on the confirmed FAULT line.
+        # Detectors that could not contribute a meaningful measurement this
+        # frame: gate-skipped (status "skipped", reason "suppressed_by_gate")
+        # and ran-but-unmeasurable (status "unavailable", e.g. tampering on a
+        # degraded baseline). Both feed the SAME "unmeasurable:" banner line:
+        # to a viewer they mean the same thing ("can't tell you right now"),
+        # so they are deliberately not distinguished visually. Passed in FULL
+        # -- including fault types that are also confirmed -- annotate.py's
+        # exclusivity logic renders the overlap as a [unmeasurable] marker on
+        # the confirmed FAULT line.
         unmeasurable_faults = tuple(
             obs.detector
             for obs in decision.detectors
-            if obs.status == DETECTOR_STATUS_SKIPPED
-            and obs.reason == "suppressed_by_gate"
+            if (
+                obs.status == DETECTOR_STATUS_SKIPPED
+                and obs.reason == "suppressed_by_gate"
+            )
+            or obs.status == DETECTOR_STATUS_UNAVAILABLE
         )
         annotated = annotate_frame(
             frame,
@@ -1028,6 +1102,37 @@ def main(argv: list[str] | None = None) -> int:
     _install_signal_handlers(stop_event)
 
     workers: list[CameraWorker] = []
+    # Approach B: startup-time enforcement of the degraded-baseline gate.
+    # Recompute the condition authoritatively from each camera's baseline
+    # edge map; skip unacknowledged-degraded cameras before any worker (and
+    # its DISK load) is built, and refuse the whole run if none remain.
+    accepted_cameras: list[tuple[str, str]] = []
+    try:
+        for camera_id, source in cameras:
+            try:
+                _check_baseline_degradation(
+                    camera_id,
+                    config.BASELINES_DIR,
+                    allow_degraded_baseline=args.allow_degraded_baseline,
+                )
+            except DegradedBaselineStartupError as exc:
+                logger.error("Camera %s skipped: %s", camera_id, exc)
+                continue
+            accepted_cameras.append((camera_id, source))
+    except (ValueError, RuntimeError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not accepted_cameras:
+        print(
+            "error: all configured cameras have unacknowledged-degraded "
+            "baselines (tampering detection would be inoperative); nothing "
+            "to run. Recapture the baselines from clean segments or pass "
+            "--allow-degraded-baseline to override this safety gate.",
+            file=sys.stderr,
+        )
+        return 2
+    cameras = accepted_cameras
+
     try:
         for camera_id, source in cameras:
             workers.append(

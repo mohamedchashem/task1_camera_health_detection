@@ -13,10 +13,11 @@ measured rendered height of the preceding label so labels never overlap.
 Banner-fix (Part A) rendering: ``build_annotation_lines`` additionally
 accepts the confirmed/pending/below-floor/unmeasurable inputs the decision
 engine now produces (``DecisionFrame.confirmed_faults``,
-``below_floor_faults``, gate-skip status). When any of them is provided,
-the five-section banner is rendered (confirmed active faults, pending
-survivors, causally-suppressed, below-floor "too weak", and gate-skipped
-"unmeasurable" detectors). When none is provided, the legacy banner
+``below_floor_faults``, gate-skip/unavailable status). When any of them is
+provided, the five-section banner is rendered (confirmed active faults,
+pending survivors, causally-suppressed, below-floor "too weak", and
+unmeasurable detectors -- gate-skipped or ran-but-unmeasurable). When none
+is provided, the legacy banner
 renders exactly as before, so current callers are unchanged.
 """
 
@@ -82,9 +83,12 @@ def build_annotation_lines(
        candidates (not confirmed), one comma-joined line.
     4. ``too weak: {type}[, {type}...]`` -- below-floor candidates, one
        comma-joined line (never called "suppressed").
-    5. ``unmeasurable: {type}[, {type}...]`` -- gate-skipped detectors this
-       frame that are not already shown via the ``[unmeasurable]`` marker,
-       one comma-joined line.
+    5. ``unmeasurable: {type}[, {type}...]`` -- detectors that could not
+       contribute a meaningful measurement this frame (gate-skipped, or ran
+       but declared unavailable e.g. a degraded tampering baseline), not
+       already shown via the ``[unmeasurable]`` marker, one comma-joined
+       line. The two causes share one line on purpose: to a viewer both mean
+       "can't tell you right now", so no visual distinction is drawn.
 
     followed by the timestamp ``t={video_time_s:.2f}s`` when provided. In
     this path the legacy ``faults``/``primary_fault``/``confidence``/
@@ -102,9 +106,9 @@ def build_annotation_lines(
     confirmed = tuple(confirmed_faults)
     pending = tuple(pending_faults)
     below_floor = tuple(below_floor_faults)
-    gate_skipped = tuple(unmeasurable_faults)
+    unmeasurable = tuple(unmeasurable_faults)
 
-    if not (confirmed or pending or below_floor or gate_skipped):
+    if not (confirmed or pending or below_floor or unmeasurable):
         return _legacy_banner(
             primary_fault,
             confidence,
@@ -128,17 +132,17 @@ def build_annotation_lines(
     )
     suppressed = _claim_exclusive(tuple(suppressed_faults), claimed, "suppressed")
     too_weak = _claim_exclusive(below_floor, claimed, "too weak")
-    # A confirmed fault that is also gate-skipped is marked on its FAULT
-    # line (documented exception); only the remaining gate-skipped
-    # detectors can appear in section 5.
-    unmeasurable = _claim_exclusive(
-        (fault for fault in gate_skipped if fault not in confirmed_names),
+    # A confirmed fault that is also unmeasurable (gate-skipped or
+    # unavailable) is marked on its FAULT line (documented exception); only
+    # the remaining unmeasurable detectors can appear in section 5.
+    unmeasurable_names = _claim_exclusive(
+        (fault for fault in unmeasurable if fault not in confirmed_names),
         claimed,
         "unmeasurable",
     )
 
     for name in _precedence_sorted(confirmed_names):
-        marker = " [unmeasurable]" if name in gate_skipped else ""
+        marker = " [unmeasurable]" if name in unmeasurable else ""
         lines.append(f"FAULT: {name} (conf={confirmed_map[name].confidence:.2f}){marker}")
     for name in _precedence_sorted(pending_names):
         lines.append(f"pending: {name} (conf={pending_map[name].confidence:.2f})")
@@ -146,8 +150,8 @@ def build_annotation_lines(
         lines.append("suppressed: " + ", ".join(_precedence_sorted(suppressed)))
     if too_weak:
         lines.append("too weak: " + ", ".join(_precedence_sorted(too_weak)))
-    if unmeasurable:
-        lines.append("unmeasurable: " + ", ".join(_precedence_sorted(unmeasurable)))
+    if unmeasurable_names:
+        lines.append("unmeasurable: " + ", ".join(_precedence_sorted(unmeasurable_names)))
     if video_time_s is not None:
         lines.append(f"t={video_time_s:.2f}s")
     return lines

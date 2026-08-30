@@ -13,10 +13,17 @@ import pytest
 
 from detectors.tampering import (
     _compute_block_density,
+    assess_obstruction_candidacy,
+    baseline_degradation_info,
+    classify_obstruction_blocks,
     compute_largest_contiguous_loss_fraction,
     compute_loss_fractions,
+    compute_retention_ratios,
     confidence_from_largest_fraction,
+    estimate_ambient_retention,
+    find_largest_obstruction_cluster,
     meaningful_block_fraction,
+    obstruction_depth_info,
 )
 from detectors.tilt import (
     _mad_inlier_mask,
@@ -25,8 +32,13 @@ from detectors.tilt import (
 )
 from config import (
     LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR,
+    TAMPERING_AMBIENT_MIN_RETENTION,
+    TAMPERING_AMBIENT_RETENTION_QUANTILE,
     TAMPERING_BLUR_AREA_SLACK,
     TAMPERING_LOW_LIGHT_AREA_SLACK,
+    TAMPERING_MIN_COMPACTNESS_RATIO,
+    TAMPERING_MIN_CONTIGUOUS_BLOCK_FRACTION,
+    TAMPERING_OBSTRUCTION_DEPTH_RATIO,
 )
 from pipeline.decision_engine import (
     _area_conserved,
@@ -116,6 +128,39 @@ def test_meaningful_block_fraction_sparse_structure() -> None:
     edges = np.zeros((64, 64), dtype=np.uint8)
     edges[0:32, 0:32] = 255
     assert meaningful_block_fraction(edges) == pytest.approx(0.25)
+
+
+# --- detectors.tampering.baseline_degradation_info ---------------------------
+# Single shared definition of a "degraded" baseline; must agree with
+# meaningful_block_fraction and pin the capture-time warning wording.
+
+
+def test_baseline_degradation_info_empty_edges_is_degraded() -> None:
+    edges = np.zeros((64, 64), dtype=np.uint8)
+    fraction, is_degraded, warning_text = baseline_degradation_info(edges)
+    assert fraction == pytest.approx(0.0)
+    assert is_degraded is True
+    assert warning_text == (
+        "tampering meaningful-block fraction 0.000 is below "
+        "TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION (0.5); "
+        "structure-loss detection is unreliable"
+    )
+
+
+def test_baseline_degradation_info_full_edges_is_clean() -> None:
+    edges = np.full((64, 64), 255, dtype=np.uint8)
+    fraction, is_degraded, warning_text = baseline_degradation_info(edges)
+    assert fraction == pytest.approx(1.0)
+    assert is_degraded is False
+    assert warning_text is None
+
+
+def test_baseline_degradation_info_sparse_structure_is_degraded() -> None:
+    edges = np.zeros((64, 64), dtype=np.uint8)
+    edges[0:32, 0:32] = 255  # 0.25 meaningful, below the 0.5 gate
+    fraction, is_degraded, _warning = baseline_degradation_info(edges)
+    assert fraction == pytest.approx(0.25)
+    assert is_degraded is True
 
 
 # --- detectors.tampering.confidence_from_largest_fraction -------------------
@@ -412,10 +457,321 @@ def test_pair_should_suppress_uses_config_slack_constants() -> None:
         {"sharpness_ratio": 1.0 - coverage - TAMPERING_BLUR_AREA_SLACK},
         0.8, 0.6,
     )
-    assert not _pair_should_suppress(
-        "tampering", "blur",
-        {"total_loss_fraction": coverage},
-        {"sharpness_ratio": 1.0 - coverage - TAMPERING_BLUR_AREA_SLACK - 1e-6},
-        0.8, 0.6,
-    )
+
+
+# --- detectors.tampering Approach A: relative ambient-retention model ---------
+# Pure scoring functions for the approved tampering-candidacy redesign
+# (subtask 6 of 10). Tests use synthetic per-block density grids only --
+# no images. evaluate() is intentionally unchanged this subtask; these
+# functions are the standalone building blocks the wiring subtask consumes.
+
+
+def _density_grid(rows: int, cols: int, value: float) -> np.ndarray:
+    return np.full((rows, cols), value, dtype=float)
+
+
+def _rectangle(rows: int, cols: int, row_slice: slice, col_slice: slice) -> np.ndarray:
+    mask = np.zeros((rows, cols), dtype=bool)
+    mask[row_slice, col_slice] = True
+    return mask
+
+
+# --- compute_retention_ratios -------------------------------------------------
+
+
+def test_retention_ratios_continuous_ratio_per_block() -> None:
+    baseline = _density_grid(4, 4, 0.5)
+    current = _density_grid(4, 4, 0.25)  # half the baseline density
+    retention, meaningful = compute_retention_ratios(baseline, current)
+    assert meaningful.all()
+    assert retention[0, 0] == pytest.approx(0.5)
+    # retained structure -> ratio 1.0, never thresholded to a binary flag
+    current[2, 2] = 0.5
+    retention, _ = compute_retention_ratios(baseline, current)
+    assert retention[2, 2] == pytest.approx(1.0)
+    # structure growth stays continuous (ratio > 1), never clipped
+    current[3, 3] = 1.0
+    retention, _ = compute_retention_ratios(baseline, current)
+    assert retention[3, 3] == pytest.approx(2.0)
+
+
+def test_retention_ratios_excludes_non_meaningful_blocks() -> None:
+    baseline = _density_grid(4, 4, 0.5)
+    baseline[0, 0] = 0.01  # below TAMPERING_MIN_BASELINE_BLOCK_EDGE_DENSITY
+    retention, meaningful = compute_retention_ratios(baseline, _density_grid(4, 4, 0.0))
+    assert not meaningful[0, 0]
+    assert np.isnan(retention[0, 0])
+    assert meaningful[1, 1]
+    assert retention[1, 1] == pytest.approx(0.0)
+
+
+def test_retention_ratios_raises_on_shape_mismatch() -> None:
+    with pytest.raises(ValueError, match="does not match"):
+        compute_retention_ratios(np.zeros((4, 4)), np.zeros((3, 3)))
+
+
+# --- estimate_ambient_retention ----------------------------------------------
+
+
+def test_ambient_retention_uses_upper_tail_not_mean() -> None:
+    # 120 of 144 blocks obstructed (retention 0.05), 24 ambient (retention
+    # 0.95). The mean is ~0.20 -- the wrong answer. The 90th-percentile upper
+    # tail is 0.95, because the obstruction sits entirely in the lower tail.
+    retention = _density_grid(12, 12, 0.95)
+    retention[_rectangle(12, 12, slice(0, 10), slice(0, 12))] = 0.05
+    meaningful = np.ones((12, 12), dtype=bool)
+    ambient = estimate_ambient_retention(retention, meaningful)
+    assert ambient == pytest.approx(0.95)
+    assert ambient != pytest.approx(0.2)  # a mean/median would sit at the obstruction level
+
+
+def test_ambient_retention_no_meaningful_blocks_is_zero() -> None:
+    retention = np.full((4, 4), np.nan)
+    meaningful = np.zeros((4, 4), dtype=bool)
+    assert estimate_ambient_retention(retention, meaningful) == 0.0
+
+
+def test_ambient_retention_collapses_with_uniform_global_degradation() -> None:
+    # Pure blur/low-light: every block drops to the same retention level, so
+    # the ambient estimate collapses with them -- there is no higher tail left.
+    retention = _density_grid(12, 12, 0.1)
+    meaningful = np.ones((12, 12), dtype=bool)
+    assert estimate_ambient_retention(retention, meaningful) == pytest.approx(0.1)
+
+
+# --- classify_obstruction_blocks ---------------------------------------------
+
+
+def test_classify_obstruction_blocks_relative_threshold() -> None:
+    retention = np.array([[0.05, 0.2], [0.4, 0.5]], dtype=float)
+    meaningful = np.ones((2, 2), dtype=bool)
+    # ambient 0.4, depth ratio 0.35 -> threshold 0.14: only 0.05 is an outlier.
+    mask = classify_obstruction_blocks(retention, meaningful, ambient=0.4)
+    assert mask[0, 0]
+    assert not mask[0, 1]
+    assert not mask[1, 0]
+    assert not mask[1, 1]
+    # Higher ambient -> proportionally higher threshold (relative, not absolute).
+    mask_high = classify_obstruction_blocks(retention, meaningful, ambient=1.0)
+    assert mask_high[0, 0] and mask_high[0, 1]  # 0.05, 0.2 <= 0.35
+    assert not mask_high[1, 0] and not mask_high[1, 1]  # 0.4, 0.5 > 0.35
+
+
+def test_classify_obstruction_blocks_zero_ambient_flags_nothing() -> None:
+    # Degenerate: with ambient == 0 the relative comparison is undefined and
+    # nothing may be flagged (0 <= 0 would otherwise flag every block).
+    retention = np.zeros((4, 4), dtype=float)
+    meaningful = np.ones((4, 4), dtype=bool)
+    mask = classify_obstruction_blocks(retention, meaningful, ambient=0.0)
+    assert not mask.any()
+
+
+def test_classify_obstruction_blocks_respects_meaningful_mask() -> None:
+    retention = _density_grid(4, 4, 0.01)
+    meaningful = np.zeros((4, 4), dtype=bool)
+    meaningful[0:2, 0:2] = True
+    mask = classify_obstruction_blocks(retention, meaningful, ambient=0.1)
+    assert mask[0:2, 0:2].all()
+    assert not mask[2:, :].any()  # non-meaningful blocks are never obstruction
+
+
+# --- find_largest_obstruction_cluster ----------------------------------------
+
+
+def test_find_largest_cluster_returns_area_and_mask() -> None:
+    mask = np.zeros((8, 8), dtype=bool)
+    mask[0:3, 0:3] = True   # 9-block cluster
+    mask[0:2, 5:8] = True   # 6-block cluster, disconnected
+    size, cluster = find_largest_obstruction_cluster(mask)
+    assert size == 9
+    assert cluster.sum() == 9
+
+
+def test_find_largest_cluster_empty_mask() -> None:
+    size, cluster = find_largest_obstruction_cluster(np.zeros((8, 8), dtype=bool))
+    assert size == 0
+    assert not cluster.any()
+
+
+def test_find_largest_cluster_single_block() -> None:
+    mask = np.zeros((4, 4), dtype=bool)
+    mask[2, 2] = True
+    size, cluster = find_largest_obstruction_cluster(mask)
+    assert size == 1
+    assert cluster[2, 2]
+
+
+# --- obstruction_depth_info ---------------------------------------------------
+
+
+def test_depth_info_deep_cluster_is_outlier() -> None:
+    retention = _density_grid(8, 8, 1.0)
+    cluster = _rectangle(8, 8, slice(0, 2), slice(0, 4))
+    retention[cluster] = 0.05
+    median, depth, is_outlier = obstruction_depth_info(cluster, retention, ambient=1.0)
+    assert median == pytest.approx(0.05)
+    assert depth == pytest.approx(0.05)
+    assert is_outlier  # 0.05 <= TAMPERING_OBSTRUCTION_DEPTH_RATIO * 1.0
+
+
+def test_depth_info_shallow_cluster_is_not_outlier() -> None:
+    retention = _density_grid(8, 8, 1.0)
+    cluster = _rectangle(8, 8, slice(0, 2), slice(0, 4))
+    retention[cluster] = 0.5
+    _median, depth, is_outlier = obstruction_depth_info(cluster, retention, ambient=1.0)
+    assert depth == pytest.approx(0.5)
+    assert not is_outlier  # 0.5 > depth ratio 0.35
+
+
+def test_depth_info_zero_ambient_is_never_outlier() -> None:
+    retention = _density_grid(8, 8, 0.0)
+    cluster = _rectangle(8, 8, slice(0, 2), slice(0, 4))
+    _median, depth, is_outlier = obstruction_depth_info(cluster, retention, ambient=0.0)
+    assert is_outlier is False
+
+
+# --- assess_obstruction_candidacy: full-scenario decisions --------------------
+
+
+def test_scenario_pure_global_degradation_no_false_candidate() -> None:
+    # Blur/low-light alone: EVERY block degrades to the same retention (0.25).
+    # Ambient collapses with them, no block sits below depth_ratio * ambient,
+    # so nothing is classified as obstruction -- must never produce a candidate.
+    baseline = _density_grid(12, 12, 0.5)
+    current = _density_grid(12, 12, 0.125)
+    assessment = assess_obstruction_candidacy(baseline, current)
+    assert assessment.is_candidate is False
+    assert assessment.reject_reason == "no_obstruction_blocks"
+    assert assessment.obstruction_block_fraction == 0.0
+
+
+def test_scenario_global_degradation_with_scattered_noise_stays_rejected() -> None:
+    # Global degradation plus a few scattered low-retention noise blocks: the
+    # noise IS below the relative threshold, but stays isolated -- no large
+    # connected cluster can form, so no false candidate.
+    baseline = _density_grid(12, 12, 0.5)
+    current = _density_grid(12, 12, 0.125)  # retention 0.25
+    for r, c in ((1, 1), (5, 3), (10, 7)):
+        current[r, c] = 0.01  # retention 0.02, well below 0.35 * 0.25
+    assessment = assess_obstruction_candidacy(baseline, current)
+    assert assessment.is_candidate is False
+    assert assessment.reject_reason == "min_size"
+    assert assessment.obstruction_block_fraction == pytest.approx(3 / 144)
+    assert assessment.largest_cluster_fraction == pytest.approx(1 / 144)
+
+
+def test_scenario_large_obstruction_no_other_degradation_is_candidate() -> None:
+    # Genuine large obstruction (120 of 144 blocks, ~83%) with no co-occurring
+    # degradation. The upper-tail ambient stays at 1.0, the obstruction is a
+    # clear outlier, and the single contiguous cluster passes every gate.
+    baseline = _density_grid(12, 12, 0.5)
+    current = _density_grid(12, 12, 0.5)
+    current[0:10, :] = 0.025  # retention 0.05 over the obstruction rectangle
+    assessment = assess_obstruction_candidacy(baseline, current)
+    assert assessment.is_candidate is True
+    assert assessment.reject_reason is None
+    assert assessment.ambient_retention == pytest.approx(1.0)
+    assert assessment.obstruction_block_fraction == pytest.approx(120 / 144)
+    assert assessment.largest_cluster_fraction >= TAMPERING_MIN_CONTIGUOUS_BLOCK_FRACTION
+    assert assessment.compactness == pytest.approx(1.0)
+    assert assessment.compactness >= TAMPERING_MIN_COMPACTNESS_RATIO
+
+
+def test_scenario_large_obstruction_with_severe_global_degradation_is_candidate() -> None:
+    # THE BUG CASE: ~83% obstruction co-occurring with severe blur that pushes
+    # ambient retention down to 0.4. The legacy absolute ceiling rejected this
+    # (total loss 0.83 > 0.75). The relative model keeps the obstruction a
+    # detectable outlier against the collapsed ambient: 0.05 vs 0.4.
+    baseline = _density_grid(12, 12, 0.5)
+    current = _density_grid(12, 12, 0.2)   # ambient retention 0.4 (blur)
+    current[0:10, :] = 0.025                # obstruction retention 0.05
+    assessment = assess_obstruction_candidacy(baseline, current)
+    assert assessment.is_candidate is True
+    assert assessment.ambient_retention == pytest.approx(0.4)
+    assert assessment.relative_depth == pytest.approx(0.05 / 0.4)
+    assert assessment.largest_cluster_fraction == pytest.approx(120 / 144)
+    assert assessment.reject_reason is None
+
+
+def test_scenario_degenerate_near_zero_ambient_does_not_confirm() -> None:
+    # Degenerate: ambient collapses to near-zero everywhere INCLUDING where
+    # the obstruction is (retention 0.01 ambient / 0.008 obstruction). The
+    # relative model must NOT confidently confirm -- this is the fully
+    # ambiguous case reserved for Approach C. Both the degeneracy floor
+    # (0.01 < TAMPERING_AMBIENT_MIN_RETENTION) and the relative threshold
+    # (0.008 > 0.35 * 0.01) reject it.
+    baseline = _density_grid(12, 12, 0.5)
+    current = _density_grid(12, 12, 0.005)  # retention 0.01 everywhere
+    current[0:10, :] = 0.004                # obstruction retention 0.008
+    assessment = assess_obstruction_candidacy(baseline, current)
+    assert assessment.is_candidate is False
+    assert assessment.reject_reason == "degraded_ambient"
+    assert assessment.ambient_retention == pytest.approx(0.01)
+    assert assessment.ambient_retention < TAMPERING_AMBIENT_MIN_RETENTION
+
+
+def test_scenario_degenerate_zero_retention_everywhere_does_not_confirm() -> None:
+    # Completely black current frame: every retention ratio is exactly 0, so
+    # ambient == 0. Without the degeneracy guard, "0 <= k * 0" would flag
+    # every block and produce a giant false candidate; the guard rejects it.
+    baseline = _density_grid(12, 12, 0.5)
+    current = _density_grid(12, 12, 0.0)
+    assessment = assess_obstruction_candidacy(baseline, current)
+    assert assessment.is_candidate is False
+    assert assessment.reject_reason == "degraded_ambient"
+    assert assessment.ambient_retention == 0.0
+
+
+def test_scenario_no_meaningful_baseline_blocks_rejected() -> None:
+    baseline = _density_grid(12, 12, 0.01)  # all below the meaningful floor
+    current = _density_grid(12, 12, 0.0)
+    assessment = assess_obstruction_candidacy(baseline, current)
+    assert assessment.is_candidate is False
+    assert assessment.reject_reason == "no_meaningful_blocks"
+    assert assessment.meaningful_block_fraction == 0.0
+
+
+def test_scenario_small_obstruction_fails_min_size() -> None:
+    # A physically tiny obstruction (10 of 144 blocks) passes ambient/depth but
+    # must not reach candidacy: below TAMPERING_MIN_CONTIGUOUS_BLOCK_FRACTION.
+    baseline = _density_grid(12, 12, 0.5)
+    current = _density_grid(12, 12, 0.5)
+    current[0:2, 0:5] = 0.025
+    assessment = assess_obstruction_candidacy(baseline, current)
+    assert assessment.is_candidate is False
+    assert assessment.reject_reason == "min_size"
+    assert assessment.largest_cluster_fraction == pytest.approx(10 / 144)
+
+
+def test_scenario_scattered_obstruction_regions_fail_compactness() -> None:
+    # Two large but disconnected obstruction regions (30 blocks each): the
+    # largest cluster is 30/144 >= min size and is a depth outlier, but holds
+    # only 50% of ALL obstruction blocks -- below TAMPERING_MIN_COMPACTNESS_RATIO.
+    # Proves compactness is NOT redundant with connected-cluster identification.
+    baseline = _density_grid(12, 12, 0.5)
+    current = _density_grid(12, 12, 0.5)
+    current[0:3, 0:10] = 0.025
+    current[9:12, 0:10] = 0.025
+    assessment = assess_obstruction_candidacy(baseline, current)
+    assert assessment.is_candidate is False
+    assert assessment.reject_reason == "compactness"
+    assert assessment.compactness == pytest.approx(0.5)
+    assert assessment.largest_cluster_fraction >= TAMPERING_MIN_CONTIGUOUS_BLOCK_FRACTION
+
+
+def test_assessment_parameterized_and_config_independent() -> None:
+    # The scoring functions are parameterized, not hard-wired to config: the
+    # same densities produce different decisions under a looser depth ratio,
+    # which is exactly the knob a future calibration would tune.
+    baseline = _density_grid(12, 12, 0.5)
+    current = _density_grid(12, 12, 0.25)  # ambient retention 0.5
+    current[0:5, 0:6] = 0.1                # 30 blocks at retention 0.2
+    default = assess_obstruction_candidacy(baseline, current)
+    assert default.reject_reason == "no_obstruction_blocks"  # 0.2 > 0.35 * 0.5
+    loose = assess_obstruction_candidacy(baseline, current, depth_ratio=0.5)
+    assert loose.is_candidate is True  # 0.2 <= 0.5 * 0.5 -> obstruction cluster
+
+
+
+
 

@@ -20,7 +20,9 @@ from config import (
     TAMPERING_TEST_MIN_TRUE_POSITIVE_CANDIDATE_RATE as MIN_TRUE_POSITIVE_CANDIDATE_RATE,
     TEST_MAX_UNRELATED_FALSE_POSITIVE_RATE as MAX_UNRELATED_FALSE_POSITIVE_RATE,
 )
-from detectors.tampering import evaluate
+from detectors.blur import compute_sharpness
+from detectors.blur import evaluate as evaluate_blur
+from detectors.tampering import compute_edge_map, compute_loss_fractions, evaluate
 from pipeline.file_reader import read_frames_from_file
 
 FIXTURE_PATH = PROJECT_ROOT / "tests" / "fixtures" / "test_video_ground_truth.json"
@@ -135,16 +137,97 @@ def test_evaluate_reports_degraded_baseline_when_structure_is_sparse() -> None:
 
 
 def test_evaluate_recalibrated_confidence_on_full_structure_baseline() -> None:
-    # With a sufficient baseline, the recalibrated confidence maps the
-    # largest lost-cluster fraction onto the normalized 0..1 scale:
-    # 0 at the candidate threshold (0.15) and 1.0 at total loss. A frame
-    # with no structure loss is not a candidate and scores 0.
+    # A uniform-gray current frame has no edges at all, so every block's
+    # retention ratio is 0 and the frame's ambient level itself collapses to
+    # zero. Under the ambient-retention model this is the DEGENERATE case:
+    # the frame demonstrably retains no structure anywhere, so no obstruction
+    # claim is meaningful and the detector must not confirm (the fully
+    # ambiguous case is handled by Approach C in a later subtask). The reason
+    # surfaces that diagnostic, where the legacy model reported a plain
+    # non-candidate with no reason at all.
     full_edges = np.full((64, 64), 255, dtype=np.uint8)  # all 4 blocks meaningful
     frame = np.zeros((64, 64, 3), dtype=np.uint8)
     frame[:, :] = (128, 128, 128)  # uniform gray -> no edges in the current frame
 
     result = evaluate(frame, full_edges)
-    assert not result.is_candidate  # total loss exceeds the global-loss ceiling
+    assert not result.is_candidate
+    assert result.reason == "degraded_ambient"
+    assert result.confidence == 0.0  # no measurable obstruction magnitude
+
+
+def _bug_case_scene() -> np.ndarray:
+    """Synthetic scene reproducing the cam_08 bug-case physics.
+
+    Strong COARSE structure (large checkerboard squares) gives the ambient
+    region edges that survive a moderate defocus, while strong FINE detail
+    (dense 4px lines) gives a high baseline Laplacian sharpness that the
+    defocus destroys -- so a blurred frame reads as severe blur (high blur
+    confidence) yet still retains measurable ambient edge structure (the new
+    model's ambient floor is 0.1, and the blurred ambient retains ~0.17).
+    """
+    height, width = 384, 384  # 12 x 12 grid of 32px blocks
+    scene = np.full((height, width, 3), 120, dtype=np.uint8)
+    step = 16
+    for y in range(0, height, step):
+        for x in range(0, width, step):
+            color = (235, 235, 235) if ((x // step) + (y // step)) % 2 == 0 else (15, 15, 15)
+            scene[y : y + 8, x : x + 8] = color
+    scene[::4, :] = 200  # fine detail: high baseline sharpness
+    scene[:, ::4] = 60
+    return scene
+
+
+def test_large_obstruction_with_severe_blur_is_detected_end_to_end() -> None:
+    # Real cam_08 evidence reproduction through the ACTUAL evaluate() path:
+    # a large obstruction (120 of 144 blocks, ~83%) co-occurring with severe
+    # global blur. The legacy absolute total-loss ceiling rejected this exact
+    # case (total loss > 0.75). The ambient-relative model must flag it: the
+    # obstruction stays a deep statistical outlier against the collapsed
+    # (blurred) ambient level.
+    scene = _bug_case_scene()
+    baseline_edges = compute_edge_map(scene)
+
+    frame = cv2.GaussianBlur(scene, (0, 0), 1.5)  # severe global defocus
+    frame[0:320, :] = (15, 15, 15)                 # large obstruction: ~83% of blocks
+
+    result = evaluate(frame, baseline_edges)
+    assert result.is_candidate is True  # the bug case is now detected
     assert result.reason is None
-    # The normalized confidence still follows the recalibrated scale.
-    assert 0.0 <= result.confidence <= 1.0
+    # raw_confidence ~0.8, matching the cam_08 evidence: confidence stays on
+    # the legacy magnitude scale (largest obstruction cluster as a fraction
+    # of meaningful blocks), so ~83% coverage maps to ~0.8.
+    assert result.confidence == pytest.approx(0.80, abs=0.05)
+    # The obstruction coverage exceeds the old 0.75 hard ceiling, i.e. the
+    # legacy gate rejected exactly this frame.
+    assert result.total_loss_fraction > 0.75
+    assert result.largest_contiguous_loss_fraction > 0.75
+    # Direct proof the frame is the bug case: the LEGACY binary structure-loss
+    # model computes a total disappeared fraction above the old ceiling too.
+    legacy_total = compute_loss_fractions(baseline_edges, compute_edge_map(frame))[1]
+    assert legacy_total > 0.75
+
+    # Sanity: the co-occurring degradation genuinely reads as severe blur.
+    blur_result = evaluate_blur(frame, compute_sharpness(scene))
+    assert bool(blur_result.is_candidate)
+    assert blur_result.confidence >= 0.90
+
+
+def test_evaluate_maps_reject_reason_to_diagnostic_reason() -> None:
+    # Two large but DISCONNECTED obstructions (3 block rows each): each passes
+    # ambient/depth/size, but together they hold only 50% of all obstruction
+    # blocks, so the compactness gate rejects. The assessment's reject reason
+    # "compactness" must surface on the result as a diagnostic reason (status
+    # OK -- a measured negative, not a non-measurement).
+    scene = _bug_case_scene()
+    baseline_edges = compute_edge_map(scene)
+    frame = scene.copy()
+    frame[0:96, :] = (15, 15, 15)     # block rows 0-2
+    frame[224:320, :] = (15, 15, 15)  # block rows 7-9, disconnected from the first
+    result = evaluate(frame, baseline_edges)
+    assert result.is_candidate is False
+    assert result.reason == "tampering_scattered"
+
+    # A clean frame (scene unchanged) is a plain negative: no reason diagnostic.
+    clean = evaluate(scene, baseline_edges)
+    assert clean.is_candidate is False
+    assert clean.reason is None

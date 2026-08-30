@@ -131,11 +131,11 @@ DETAIL_NOISE_SIGMA = 13.0
 #                   enough that the scene's Canny edges survive H.264/MPEG-4
 #                   re-encoding for the tampering detector (at factor <= ~0.6
 #                   the darkening itself removes edges globally and tampering
-#                   is rejected; 0.75 measured too close to the 0.75
-#                   total-loss ceiling once encoding noise is included). The
-#                   low-light candidate fires but stays well below the
-#                   engine's 0.5 confirmation floor -- the honest
-#                   cross-triggering tradeoff the decision layer sees.
+#                   is rejected; 0.78 measured too close to the block-drop
+#                   boundary once encoding noise is included). The low-light
+#                   candidate fires but stays well below the engine's 0.5
+#                   confirmation floor -- the honest cross-triggering
+#                   tradeoff the decision layer sees.
 #   NEAR_BLACK      essentially black; trips the low-light gate (>=0.8),
 #                   which is the near-black scenario the decision layer
 #                   models (segment 8).
@@ -170,8 +170,10 @@ TILT_TRANSLATION_PX = (200.0, 70.0)
 #   SMALL  ~18% of frame area: fires the tampering detector's per-frame
 #          candidate but stays below the decision engine's tampering
 #          confirmation floor (~57% contiguous structure loss needed).
-#   LARGE  ~65% of frame area: clears that floor with margin (and stays
-#          under the detector's 0.75 global-loss ceiling).
+#   LARGE  ~65% of frame area: clears that floor with margin (and stays a
+#          large compact cluster, so the relative ambient-retention model
+#          flags it as a deep outlier rather than hitting any absolute
+#          ceiling).
 # The fill is a mid-gray solid: dark enough to read as an obstruction but
 # with HSV value (~88) above the low-light dark-pixel threshold (60), so it
 # does not perturb the dark-pixel ratio (the previous near-black fill pushed

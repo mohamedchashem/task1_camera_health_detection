@@ -25,6 +25,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
+import cv2
 import numpy as np
 import pytest
 import torch
@@ -398,6 +399,25 @@ def test_metrics_observations_tally_per_detector() -> None:
     assert snap["candidate_counts"] == {"low_light": 1}
     assert snap["error_counts"] == {"blur": 1}
     assert snap["skipped_counts"] == {"tilt": 1}
+
+
+def test_metrics_observations_tally_unavailable() -> None:
+    from pipeline.decision_engine import DETECTOR_STATUS_UNAVAILABLE, DetectorObservation
+
+    metrics = CameraMetrics("cam1")
+    decision = SimpleNamespace(detectors=(
+        DetectorObservation("tampering", DETECTOR_STATUS_UNAVAILABLE, False, 0.0),
+        DetectorObservation("tilt", "skipped", False, 0.0),
+        DetectorObservation("blur", "error", False, 0.0, "boom"),
+    ))
+    metrics.record_observations(decision)
+    snap = metrics.snapshot()
+    # unavailable is its own counter, using the same per-detector pattern as
+    # the existing candidate/error/skipped counters.
+    assert snap["unavailable_counts"] == {"tampering": 1}
+    assert snap["skipped_counts"] == {"tilt": 1}
+    assert snap["error_counts"] == {"blur": 1}
+    assert snap["candidate_counts"] == {}
 
 
 # --- CameraWorker ------------------------------------------------------------
@@ -785,6 +805,263 @@ def test_worker_snapshot_marks_gate_skipped_confirmed_fault_unmeasurable(
     assert "unmeasurable: tilt" in lines
 
 
+def test_worker_snapshot_renders_unavailable_detector_unmeasurable_same_line(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Degraded-baseline tampering runs but declares itself unmeasurable
+    # (observation status "unavailable", reason "degraded_baseline"). On the
+    # frame blur confirms, tampering must be listed on the SAME "unmeasurable:"
+    # banner line a gate-skipped detector would use -- one shared category, no
+    # visual distinction, because to a viewer both mean "can't tell you right
+    # now".
+    frames = [
+        (1, 1.0, _marker_frame(1)),
+        (2, 2.0, _marker_frame(2)),
+        (3, 3.0, _marker_frame(3)),
+    ]
+    _inject_frames(monkeypatch, frames)
+    tampering_det = _Detector(_Result(False, 0.0, reason="degraded_baseline"))
+    dets = {
+        "blur": _ScriptedDetector({
+            1: _Result(True, 0.9),
+            2: _Result(True, 0.9),
+            3: _Result(True, 0.9),
+        }),
+        "tampering": tampering_det,
+    }
+    event_frames = tmp_path / "event_frames"
+
+    real_annotate = main_module.annotate_frame
+    captured = []
+
+    def _spy(frame, primary_fault, confidence, **kwargs):
+        captured.append({"primary": primary_fault, "confidence": confidence, **kwargs})
+        return real_annotate(frame, primary_fault, confidence, **kwargs)
+
+    monkeypatch.setattr(main_module, "annotate_frame", _spy)
+
+    worker = CameraWorker(
+        "cam1", "missing.mp4", detectors=dets, event_frames_dir=event_frames
+    )
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+
+    # tampering RAN on every frame (it is unavailable, not gate-skipped).
+    assert tampering_det.calls == 3
+    assert len(captured) == 1  # blur confirms at frame 3 -> one snapshot
+    render = captured[0]
+    assert render["primary"] == "blur"
+    assert tuple(render["unmeasurable_faults"]) == ("tampering",)
+
+    lines = build_annotation_lines(
+        render["primary"],
+        render["confidence"],
+        suppressed_faults=render["suppressed_faults"],
+        video_time_s=render["video_time_s"],
+        faults=render["faults"],
+        confirmed_faults=render["confirmed_faults"],
+        pending_faults=render["pending_faults"],
+        below_floor_faults=render["below_floor_faults"],
+        unmeasurable_faults=render["unmeasurable_faults"],
+    )
+    # Identical line format to the gate-skip-caused "unmeasurable:" line.
+    assert "unmeasurable: tampering" in lines
+    assert "FAULT: blur (conf=0.90)" in lines
+    assert "t=3.00s" in lines
+
+    snap = worker.metrics.snapshot()
+    assert snap["unavailable_counts"] == {"tampering": 3}
+    assert snap["skipped_counts"] == {}
+    assert snap["error_counts"] == {}
+
+
+def test_worker_snapshot_renders_degraded_ambient_explained_unmeasurable_same_line(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Approach C (subtasks 8-9): tampering's ambient retention collapsed AND
+    # the same frame's blur is independently severe (0.9 >= the contamination
+    # floor), so the engine resolves the observation to status "unavailable",
+    # reason "degraded_ambient_explained". main.py's banner logic keys on
+    # status alone -- no reason special-casing -- so this must render as the
+    # same "unmeasurable: tampering" line as a gate-skip / degraded-baseline
+    # cause, and CameraMetrics must tally it into unavailable_counts. This
+    # proves the generic mechanism from subtask 4 already handles the third
+    # cause with ZERO new wiring.
+    from pipeline.decision_engine import (
+        DETECTOR_STATUS_UNAVAILABLE,
+        DEGRADED_AMBIENT_EXPLAINED_REASON,
+    )
+
+    frames = [
+        (1, 1.0, _marker_frame(1)),
+        (2, 2.0, _marker_frame(2)),
+        (3, 3.0, _marker_frame(3)),
+    ]
+    _inject_frames(monkeypatch, frames)
+    dets = {
+        # Severe blur confirms on frame 3 and independently explains the
+        # ambient collapse -> tampering resolves to degraded_ambient_explained.
+        "blur": _ScriptedDetector({
+            1: _Result(True, 0.9),
+            2: _Result(True, 0.9),
+            3: _Result(True, 0.9),
+        }),
+        "tampering": _Detector(_Result(False, 0.0, reason="degraded_ambient")),
+    }
+    event_frames = tmp_path / "event_frames"
+
+    real_annotate = main_module.annotate_frame
+    captured = []
+    decisions = []
+
+    def _spy(frame, primary_fault, confidence, **kwargs):
+        captured.append({"primary": primary_fault, "confidence": confidence, **kwargs})
+        return real_annotate(frame, primary_fault, confidence, **kwargs)
+
+    real_engine = main_module.DecisionEngine
+
+    class _RecordingEngine(real_engine):
+        def process_frame(self, frame, frame_number, video_time_s, enabled_faults=None):
+            decision = super().process_frame(
+                frame, frame_number, video_time_s, enabled_faults=enabled_faults
+            )
+            decisions.append(decision)
+            return decision
+
+    monkeypatch.setattr(main_module, "DecisionEngine", _RecordingEngine)
+    monkeypatch.setattr(main_module, "annotate_frame", _spy)
+
+    worker = CameraWorker(
+        "cam1", "missing.mp4", detectors=dets, event_frames_dir=event_frames
+    )
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+
+    render = captured[0]
+    assert render["primary"] == "blur"
+    assert tuple(render["unmeasurable_faults"]) == ("tampering",)
+
+    # The engine really produced the explained non-measurement on the
+    # snapshot frame (subtask 8's resolution, not a degraded baseline).
+    tampering_obs = {o.detector: o for o in decisions[-1].detectors}["tampering"]
+    assert tampering_obs.status == DETECTOR_STATUS_UNAVAILABLE
+    assert tampering_obs.reason == DEGRADED_AMBIENT_EXPLAINED_REASON
+
+    lines = build_annotation_lines(
+        render["primary"],
+        render["confidence"],
+        suppressed_faults=render["suppressed_faults"],
+        video_time_s=render["video_time_s"],
+        faults=render["faults"],
+        confirmed_faults=render["confirmed_faults"],
+        pending_faults=render["pending_faults"],
+        below_floor_faults=render["below_floor_faults"],
+        unmeasurable_faults=render["unmeasurable_faults"],
+    )
+    # Identical line format to the gate-skip / degraded-baseline cases.
+    assert "unmeasurable: tampering" in lines
+    assert "FAULT: blur (conf=0.90)" in lines
+    assert "t=3.00s" in lines
+
+    snap = worker.metrics.snapshot()
+    assert snap["unavailable_counts"] == {"tampering": 3}
+    assert snap["skipped_counts"] == {}
+    assert snap["error_counts"] == {}
+
+
+def test_worker_snapshot_renders_degraded_ambient_unexplained_unmeasurable_same_line(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Approach C (subtasks 8-9): tampering's ambient retention collapsed but
+    # NO other detector is severe at that frame (blur 0.5 < the 0.9
+    # contamination floor), so the engine resolves the observation to status
+    # "unavailable", reason "degraded_ambient_unexplained". Practical handling
+    # is identical to the explained case (subtask 8 decision): excluded from
+    # the tracker, and on the banner it is still the one simple
+    # "unmeasurable: tampering" line. The explained-vs-unexplained distinction
+    # stays in the frame log, never on the banner.
+    from pipeline.decision_engine import (
+        DETECTOR_STATUS_UNAVAILABLE,
+        DEGRADED_AMBIENT_UNEXPLAINED_REASON,
+    )
+
+    frames = [
+        (1, 1.0, _marker_frame(1)),
+        (2, 2.0, _marker_frame(2)),
+        (3, 3.0, _marker_frame(3)),
+    ]
+    _inject_frames(monkeypatch, frames)
+    dets = {
+        # A real but not-severe blur confirms (so a snapshot triggers) while
+        # staying below the contamination floor -> tampering stays unexplained.
+        "blur": _ScriptedDetector({
+            1: _Result(True, 0.5),
+            2: _Result(True, 0.5),
+            3: _Result(True, 0.5),
+        }),
+        "tampering": _Detector(_Result(False, 0.0, reason="degraded_ambient")),
+    }
+    event_frames = tmp_path / "event_frames"
+
+    real_annotate = main_module.annotate_frame
+    captured = []
+    decisions = []
+
+    def _spy(frame, primary_fault, confidence, **kwargs):
+        captured.append({"primary": primary_fault, "confidence": confidence, **kwargs})
+        return real_annotate(frame, primary_fault, confidence, **kwargs)
+
+    real_engine = main_module.DecisionEngine
+
+    class _RecordingEngine(real_engine):
+        def process_frame(self, frame, frame_number, video_time_s, enabled_faults=None):
+            decision = super().process_frame(
+                frame, frame_number, video_time_s, enabled_faults=enabled_faults
+            )
+            decisions.append(decision)
+            return decision
+
+    monkeypatch.setattr(main_module, "DecisionEngine", _RecordingEngine)
+    monkeypatch.setattr(main_module, "annotate_frame", _spy)
+
+    worker = CameraWorker(
+        "cam1", "missing.mp4", detectors=dets, event_frames_dir=event_frames
+    )
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+
+    render = captured[0]
+    assert render["primary"] == "blur"
+    assert tuple(render["unmeasurable_faults"]) == ("tampering",)
+
+    tampering_obs = {o.detector: o for o in decisions[-1].detectors}["tampering"]
+    assert tampering_obs.status == DETECTOR_STATUS_UNAVAILABLE
+    assert tampering_obs.reason == DEGRADED_AMBIENT_UNEXPLAINED_REASON
+
+    lines = build_annotation_lines(
+        render["primary"],
+        render["confidence"],
+        suppressed_faults=render["suppressed_faults"],
+        video_time_s=render["video_time_s"],
+        faults=render["faults"],
+        confirmed_faults=render["confirmed_faults"],
+        pending_faults=render["pending_faults"],
+        below_floor_faults=render["below_floor_faults"],
+        unmeasurable_faults=render["unmeasurable_faults"],
+    )
+    assert "unmeasurable: tampering" in lines
+    assert "FAULT: blur (conf=0.50)" in lines
+    assert "t=3.00s" in lines
+
+    snap = worker.metrics.snapshot()
+    assert snap["unavailable_counts"] == {"tampering": 3}
+    assert snap["skipped_counts"] == {}
+    assert snap["error_counts"] == {}
+
+
 def test_worker_snapshot_renders_confirmed_fault_without_current_candidates(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1012,6 +1289,203 @@ def test_main_end_to_end(tmp_path: Path, monkeypatch, tilt_state) -> None:
     # Per-camera frame log and event DB were produced.
     assert (tmp_path / "frame_log_cam1.jsonl").exists()
     assert (tmp_path / "events.db").exists()
+
+
+# --- Approach B: degraded-baseline startup gate ----------------------------
+# The gate recomputes the degraded condition from the baseline edge map via
+# detectors.tampering.baseline_degradation_info (never trusts the JSON text)
+# and refuses unacknowledged-degraded cameras unless overridden.
+
+
+def _write_baseline(
+    baselines_dir: Path,
+    camera_id: str,
+    *,
+    degraded: bool,
+    acknowledged: bool = False,
+) -> None:
+    """Write a minimal baseline (JSON record + edges PNG) for gate tests.
+
+    ``degraded=False`` writes an all-edges map (meaningful-block fraction
+    1.0); ``degraded=True`` writes an empty edge map (fraction 0.0, below
+    the TAMPERING_MIN_MEANINGFUL_BLOCK_FRACTION gate).
+    """
+    baselines_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "camera_id": camera_id,
+        "lowlight_dark_pixel_ratio": 0.0,
+        "blur_baseline_sharpness": 1000.0,
+        "tampering_meaningful_block_fraction": 1.0 if not degraded else 0.0,
+        "quality_warnings": [],
+        "frames_averaged": 90,
+        "captured_at": 0.0,
+    }
+    if acknowledged:
+        record["degraded_acknowledged"] = True
+        record["degraded_acknowledged_at"] = 0.0
+    (baselines_dir / f"{camera_id}.json").write_text(json.dumps(record))
+    edges = np.full((64, 64), 255, dtype=np.uint8) if not degraded else np.zeros(
+        (64, 64), dtype=np.uint8
+    )
+    cv2.imwrite(str(baselines_dir / f"{camera_id}_edges.png"), edges)
+
+
+def test_baseline_gate_refuses_unacknowledged_degraded(tmp_path: Path) -> None:
+    _write_baseline(tmp_path, "cam_bad", degraded=True, acknowledged=False)
+
+    with pytest.raises(main_module.DegradedBaselineStartupError) as excinfo:
+        main_module._check_baseline_degradation(
+            "cam_bad", tmp_path, allow_degraded_baseline=False
+        )
+
+    message = str(excinfo.value)
+    assert "cam_bad" in message
+    # Condition text reuses the capture-time warning style.
+    assert "structure-loss detection is unreliable" in message
+    assert "inoperative" in message
+    # Remediation is explicit.
+    assert "recapture" in message.lower()
+    assert "--allow-degraded-baseline" in message
+
+
+def test_baseline_gate_acknowledged_degraded_starts_with_warning(
+    tmp_path: Path, caplog
+) -> None:
+    _write_baseline(tmp_path, "cam_bad", degraded=True, acknowledged=True)
+
+    with caplog.at_level(logging.WARNING, logger="main"):
+        main_module._check_baseline_degradation(
+            "cam_bad", tmp_path, allow_degraded_baseline=False
+        )
+
+    assert any(
+        "DEGRADED BASELINE" in record.message
+        and "cam_bad" in record.message
+        and "inoperative" in record.message
+        for record in caplog.records
+    )
+
+
+def test_baseline_gate_allow_degraded_baseline_overrides_unacknowledged(
+    tmp_path: Path, caplog
+) -> None:
+    _write_baseline(tmp_path, "cam_bad", degraded=True, acknowledged=False)
+
+    with caplog.at_level(logging.WARNING, logger="main"):
+        main_module._check_baseline_degradation(
+            "cam_bad", tmp_path, allow_degraded_baseline=True
+        )
+
+    assert any(
+        "DEGRADED BASELINE" in record.message and "cam_bad" in record.message
+        for record in caplog.records
+    )
+
+
+
+def test_main_refuses_all_unacknowledged_degraded_cameras(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    baselines_dir = tmp_path / "baselines"
+    _write_baseline(baselines_dir, "cam_bad", degraded=True, acknowledged=False)
+    monkeypatch.setattr(config, "BASELINES_DIR", baselines_dir)
+    monkeypatch.setattr(main_module, "_setup_logging", lambda level, log_file=None: None)
+    monkeypatch.setattr(main_module, "_install_signal_handlers", lambda stop_event: None)
+    monkeypatch.setattr(main_module, "resolve_device", lambda args: "cpu")
+
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"not-a-real-video")  # exists -> passes the pre-flight check
+    exit_code = main_module.main(["--camera", f"cam_bad={source}"])
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "unacknowledged-degraded" in err
+    assert "--allow-degraded-baseline" in err
+
+
+def test_main_skips_unacknowledged_degraded_and_starts_clean(
+    tmp_path: Path, monkeypatch
+) -> None:
+    baselines_dir = tmp_path / "baselines"
+    _write_baseline(baselines_dir, "cam_bad", degraded=True, acknowledged=False)
+    _write_baseline(baselines_dir, "cam_ok", degraded=False, acknowledged=False)
+    monkeypatch.setattr(config, "BASELINES_DIR", baselines_dir)
+    monkeypatch.setattr(main_module, "_setup_logging", lambda level, log_file=None: None)
+    monkeypatch.setattr(main_module, "_install_signal_handlers", lambda stop_event: None)
+    monkeypatch.setattr(main_module, "resolve_device", lambda args: "cpu")
+    monkeypatch.setattr(
+        main_module, "_build_detectors",
+        lambda cid, bdir: {"blur": _Detector(_Result(False, 0.0))},
+    )
+    _inject_frames(monkeypatch, [(1, 0.0, _frame()), (2, 1.0, _frame())])
+    monkeypatch.setattr(config, "METRICS_LOG_INTERVAL_SECONDS", 0.1)
+
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"not-a-real-video")
+    exit_code = main_module.main([
+        "--camera", f"cam_bad={source}",
+        "--camera", f"cam_ok={source}",
+        "--session-id", "itest",
+        "--db", str(tmp_path / "events.db"),
+        "--frame-log", str(tmp_path / "frame_log.jsonl"),
+        "--system-log", str(tmp_path / "system.jsonl"),
+        "--event-frames", str(tmp_path / "event_frames"),
+    ])
+
+    assert exit_code == 0
+    # The clean camera ran and produced its per-camera frame log; the
+    # unacknowledged-degraded camera was skipped and never started.
+    assert (tmp_path / "frame_log_cam_ok.jsonl").exists()
+    assert not (tmp_path / "frame_log_cam_bad.jsonl").exists()
+
+
+def test_main_allow_degraded_baseline_flag_starts_unacknowledged(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    baselines_dir = tmp_path / "baselines"
+    _write_baseline(baselines_dir, "cam_bad", degraded=True, acknowledged=False)
+    monkeypatch.setattr(config, "BASELINES_DIR", baselines_dir)
+    monkeypatch.setattr(main_module, "_setup_logging", lambda level, log_file=None: None)
+    monkeypatch.setattr(main_module, "_install_signal_handlers", lambda stop_event: None)
+    monkeypatch.setattr(main_module, "resolve_device", lambda args: "cpu")
+    monkeypatch.setattr(
+        main_module, "_build_detectors",
+        lambda cid, bdir: {"blur": _Detector(_Result(False, 0.0))},
+    )
+    _inject_frames(monkeypatch, [(1, 0.0, _frame())])
+    monkeypatch.setattr(config, "METRICS_LOG_INTERVAL_SECONDS", 0.1)
+
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"not-a-real-video")
+    with caplog.at_level(logging.WARNING, logger="main"):
+        exit_code = main_module.main([
+            "--camera", f"cam_bad={source}",
+            "--allow-degraded-baseline",
+            "--session-id", "itest",
+            "--db", str(tmp_path / "events.db"),
+            "--frame-log", str(tmp_path / "frame_log.jsonl"),
+            "--system-log", str(tmp_path / "system.jsonl"),
+            "--event-frames", str(tmp_path / "event_frames"),
+        ])
+
+    assert exit_code == 0
+    # The overridden camera started (its per-camera frame log exists) and a
+    # prominent startup warning was logged.
+    assert (tmp_path / "frame_log_cam_bad.jsonl").exists()
+    assert any(
+        "DEGRADED BASELINE" in record.message and "cam_bad" in record.message
+        for record in caplog.records
+    )
+
+def test_baseline_gate_clean_baseline_no_warning(tmp_path: Path, caplog) -> None:
+    _write_baseline(tmp_path, "cam_ok", degraded=False, acknowledged=False)
+
+    with caplog.at_level(logging.WARNING, logger="main"):
+        main_module._check_baseline_degradation(
+            "cam_ok", tmp_path, allow_degraded_baseline=False
+        )
+
+    assert not any("DEGRADED BASELINE" in record.message for record in caplog.records)
 
 
 

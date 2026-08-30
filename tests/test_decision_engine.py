@@ -25,6 +25,9 @@ from pipeline.decision_engine import (
     DETECTOR_STATUS_ERROR,
     DETECTOR_STATUS_OK,
     DETECTOR_STATUS_SKIPPED,
+    DETECTOR_STATUS_UNAVAILABLE,
+    DEGRADED_AMBIENT_EXPLAINED_REASON,
+    DEGRADED_AMBIENT_UNEXPLAINED_REASON,
     EVENT_STATUS_CLEARED,
     EVENT_STATUS_CONFIRMED,
     TEMPORAL_STATUS_CONFIRMED,
@@ -38,6 +41,7 @@ from pipeline.decision_engine import (
     fuse_observations,
     resolve_primary_fault,
     split_candidates_for_primary,
+    _resolve_degraded_ambient,
 )
 
 GATE = DECISION_SUPPRESSOR_MIN_CONFIDENCE
@@ -703,6 +707,295 @@ def test_blur_below_gate_keeps_tilt_active() -> None:
     )
     engine.process_frame(_frame(), 0, 0.0)
     assert calls["tilt"] == 1
+
+
+# --- Degraded-baseline non-measurements (Approach C) -------------------------
+
+
+def test_degraded_baseline_observation_is_unavailable_not_ok() -> None:
+    # A degraded-baseline tampering result means "ran but could not measure":
+    # it must NOT be packaged as a genuine OK negative observation. It gets a
+    # distinct status (unavailable) while is_candidate/confidence/raw_confidence
+    # keep their correct False/0.0 semantics.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "tampering": _Detector(
+                result=_Result(
+                    is_candidate=False,
+                    confidence=0.0,
+                    reason="degraded_baseline",
+                )
+            )
+        },
+    )
+    decision = engine.process_frame(_frame(), 0, 0.0)
+    obs = decision.detectors[0]
+    assert obs.status == DETECTOR_STATUS_UNAVAILABLE
+    assert obs.reason == "degraded_baseline"
+    assert obs.is_candidate is False
+    assert obs.confidence == 0.0
+    assert obs.raw_confidence == 0.0
+    # It is not a candidate and never enters fusion.
+    assert decision.faults == ()
+    assert decision.primary_fault is None
+
+
+def test_degraded_baseline_frames_do_not_dilute_positive_rate() -> None:
+    # Degraded-baseline frames are non-measurements, not negative samples:
+    # they must not be counted in the tracker's observed set, so a confirmed
+    # tampering window keeps its 3/3 positive rate instead of being diluted
+    # toward zero and spuriously clearing.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "tampering": _Detector(result=_Result(is_candidate=True, confidence=0.7)),
+        },
+    )
+    # Three real candidate frames confirm tampering (rate 1.0, 3 observed).
+    for frame_number, t in [(0, 0.0), (1, 0.5), (2, 1.0)]:
+        engine.process_frame(_frame(), frame_number, t)
+    events = engine.drain_events()
+    assert len(events) == 1
+    assert events[0].status == EVENT_STATUS_CONFIRMED
+    assert events[0].window_positive_rate == pytest.approx(1.0)
+
+    # Switch the detector to a degraded baseline (never a measurement). Four
+    # non-measurement frames follow at t=1.5..3.0. If they counted as observed
+    # negatives the window would be 3/7 = 0.43 < 0.5 and tampering would clear;
+    # excluded, the window keeps its three positives and stays confirmed.
+    engine._detectors["tampering"] = _Detector(
+        result=_Result(
+            is_candidate=False,
+            confidence=0.0,
+            reason="degraded_baseline",
+        )
+    )
+    for frame_number, t in [(3, 1.5), (4, 2.0), (5, 2.5), (6, 3.0)]:
+        engine.process_frame(_frame(), frame_number, t)
+
+    assert engine.drain_events() == []  # no spurious clear
+    assert engine._tracker.confirmation_status()["tampering"] == TEMPORAL_STATUS_CONFIRMED
+    # The tracker window holds only the three real observations.
+    assert len(engine._tracker._windows["tampering"]) == 3
+
+
+def test_all_frames_degraded_baseline_never_observed_no_crash() -> None:
+    # A camera whose tampering baseline is degraded for its ENTIRE lifetime:
+    # tampering is never observed, so its tracker window is never created.
+    # _window_rate must handle the zero-observed case without a divide-by-zero
+    # and the engine must never confirm or clear a phantom tampering event.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "tampering": _Detector(
+                result=_Result(
+                    is_candidate=False,
+                    confidence=0.0,
+                    reason="degraded_baseline",
+                )
+            ),
+        },
+    )
+    for frame_number in range(20):
+        decision = engine.process_frame(_frame(), frame_number, float(frame_number))
+        obs = decision.detectors[0]
+        assert obs.status == DETECTOR_STATUS_UNAVAILABLE
+        assert obs.reason == "degraded_baseline"
+        assert decision.confirmed_faults == ()
+
+    assert engine.drain_events() == []
+    # Never observed -> tampering never appears in temporal status (no window).
+    assert "tampering" not in engine._tracker.confirmation_status()
+    assert engine._tracker._windows.get("tampering") is None
+
+
+# --- Degraded-ambient collapse (Approach C, subtask 8) -----------------------
+
+
+def test_degraded_ambient_explained_by_severe_blur_is_unavailable_not_ok() -> None:
+    # Tampering ran but the frame's ambient retention collapsed below the
+    # degeneracy floor AND the same frame's blur is independently severe
+    # (0.95 >= the contamination floor). The collapse is explained by
+    # contamination: tampering's contribution is "unverifiable, explained"
+    # (status unavailable, reason degraded_ambient_explained) -- never a
+    # measured negative, never a candidate.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "low_light": _Detector(result=_Result(is_candidate=False, confidence=0.0)),
+            "blur": _Detector(result=_Result(is_candidate=True, confidence=0.95)),
+            "tampering": _Detector(
+                result=_Result(
+                    is_candidate=False, confidence=0.0, reason="degraded_ambient"
+                )
+            ),
+        },
+    )
+    decision = engine.process_frame(_frame(), 0, 0.0)
+    obs = {o.detector: o for o in decision.detectors}["tampering"]
+    assert obs.status == DETECTOR_STATUS_UNAVAILABLE
+    assert obs.reason == DEGRADED_AMBIENT_EXPLAINED_REASON
+    assert obs.is_candidate is False
+    assert obs.confidence == 0.0
+    # The severe blur is its own genuine fault this frame; tampering is not.
+    assert decision.primary_fault == "blur"
+    # Excluded from the tracker's observed set: no window is ever created.
+    assert engine._tracker._windows.get("tampering") is None
+    assert "tampering" not in engine._tracker.confirmation_status()
+
+
+def test_degraded_ambient_unexplained_is_still_not_a_clean_negative() -> None:
+    # Ambient retention collapsed but NO other detector is severely degraded
+    # at that frame. Per the subtask-8 decision, this unexplained case keeps
+    # the same practical handling as the explained one -- excluded from the
+    # observed set, never a false clean negative -- but is distinguished for
+    # diagnostics via the reason string.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "low_light": _Detector(result=_Result(is_candidate=False, confidence=0.0)),
+            "blur": _Detector(result=_Result(is_candidate=False, confidence=0.0)),
+            "tampering": _Detector(
+                result=_Result(
+                    is_candidate=False, confidence=0.0, reason="degraded_ambient"
+                )
+            ),
+        },
+    )
+    decision = engine.process_frame(_frame(), 0, 0.0)
+    obs = {o.detector: o for o in decision.detectors}["tampering"]
+    assert obs.status == DETECTOR_STATUS_UNAVAILABLE
+    assert obs.reason == DEGRADED_AMBIENT_UNEXPLAINED_REASON
+    assert obs.is_candidate is False
+    assert decision.primary_fault is None
+    assert engine._tracker._windows.get("tampering") is None
+    assert "tampering" not in engine._tracker.confirmation_status()
+
+
+def test_degraded_ambient_explained_by_severe_low_light() -> None:
+    # The low_light branch of the contamination resolution: low_light at/above
+    # its near-black floor independently explains the ambient collapse. This
+    # path is defensive in the current gate configuration (low_light >= 0.8
+    # gate-skips tampering before it can produce a degraded_ambient result),
+    # so it is exercised directly on the observation list via the
+    # gate-independent helper rather than through process_frame.
+    observations = [
+        DetectorObservation("low_light", DETECTOR_STATUS_OK, True, 0.85),
+        DetectorObservation("blur", DETECTOR_STATUS_OK, False, 0.0),
+        DetectorObservation(
+            "tampering", DETECTOR_STATUS_UNAVAILABLE, False, 0.0,
+            reason="degraded_ambient",
+        ),
+    ]
+    resolved = _resolve_degraded_ambient(observations)
+    by_name = {o.detector: o for o in resolved}
+    tampering = by_name["tampering"]
+    assert tampering.status == DETECTOR_STATUS_UNAVAILABLE
+    assert tampering.reason == DEGRADED_AMBIENT_EXPLAINED_REASON
+    # Non-tampering observations pass through untouched.
+    assert by_name["low_light"].confidence == 0.85
+    assert by_name["blur"].confidence == 0.0
+
+
+def test_degraded_ambient_frames_do_not_dilute_positive_rate() -> None:
+    # Mirror of the degraded_baseline dilution regression: degraded_ambient
+    # frames are non-measurements, not negative samples. They must not count
+    # in the tracker's observed set, so a confirmed tampering window keeps its
+    # 3/3 positive rate instead of being diluted toward zero and clearing.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "low_light": _Detector(result=_Result(is_candidate=False, confidence=0.0)),
+            "blur": _Detector(result=_Result(is_candidate=False, confidence=0.0)),
+            "tampering": _Detector(result=_Result(is_candidate=True, confidence=0.7)),
+        },
+    )
+    # Three real candidate frames confirm tampering (rate 1.0, 3 observed).
+    for frame_number, t in [(0, 0.0), (1, 0.5), (2, 1.0)]:
+        engine.process_frame(_frame(), frame_number, t)
+    events = engine.drain_events()
+    assert len(events) == 1
+    assert events[0].status == EVENT_STATUS_CONFIRMED
+    assert events[0].window_positive_rate == pytest.approx(1.0)
+
+    # Switch tampering to an unexplained degraded-ambient collapse. Four
+    # non-measurement frames follow at t=1.5..3.0. If they counted as observed
+    # negatives the window would be 3/7 = 0.43 < 0.5 and tampering would
+    # clear; excluded, the window keeps its three positives and stays
+    # confirmed.
+    engine._detectors["tampering"] = _Detector(
+        result=_Result(
+            is_candidate=False, confidence=0.0, reason="degraded_ambient"
+        )
+    )
+    for frame_number, t in [(3, 1.5), (4, 2.0), (5, 2.5), (6, 3.0)]:
+        engine.process_frame(_frame(), frame_number, t)
+
+    assert engine.drain_events() == []  # no spurious clear
+    assert engine._tracker.confirmation_status()["tampering"] == TEMPORAL_STATUS_CONFIRMED
+    # The tracker window holds only the three real observations.
+    assert len(engine._tracker._windows["tampering"]) == 3
+
+
+def test_all_frames_degraded_ambient_never_observed_no_crash() -> None:
+    # A camera whose frames' ambient retention collapses for its ENTIRE
+    # lifetime with nothing explaining it (e.g. full-lens obstruction or
+    # total sensor failure): tampering is never observed, its tracker window
+    # is never created, and the engine must neither confirm nor clear a
+    # phantom tampering event -- the same no-crash/no-misbehavior guarantee
+    # subtask 3 established for all-frames-degraded-baseline.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "low_light": _Detector(result=_Result(is_candidate=False, confidence=0.0)),
+            "blur": _Detector(result=_Result(is_candidate=False, confidence=0.0)),
+            "tampering": _Detector(
+                result=_Result(
+                    is_candidate=False, confidence=0.0, reason="degraded_ambient"
+                )
+            ),
+        },
+    )
+    for frame_number in range(20):
+        decision = engine.process_frame(_frame(), frame_number, float(frame_number))
+        obs = {o.detector: o for o in decision.detectors}["tampering"]
+        assert obs.status == DETECTOR_STATUS_UNAVAILABLE
+        assert obs.reason == DEGRADED_AMBIENT_UNEXPLAINED_REASON
+        assert decision.confirmed_faults == ()
+
+    assert engine.drain_events() == []
+    # Never observed -> tampering never appears in temporal status (no window).
+    assert "tampering" not in engine._tracker.confirmation_status()
+    assert engine._tracker._windows.get("tampering") is None
+
+
+def test_gate_skipped_observation_stays_out_of_tracker_window() -> None:
+    # Regression: a gate-skipped detector (status "skipped", reason
+    # "suppressed_by_gate") is excluded from the confirmation tracker's
+    # observed set exactly as before this subtask -- its window never gains
+    # entries and it never confirms.
+    engine = DecisionEngine(
+        "cam1",
+        {
+            "low_light": _Detector(
+                result=_Result(
+                    is_candidate=True,
+                    confidence=DECISION_GATE_CONFIDENCE + 0.1,
+                )
+            ),
+            "tampering": _Detector(result=_Result(is_candidate=False)),
+        },
+    )
+    decision = engine.process_frame(_frame(), 0, 0.0)
+    by_name = {obs.detector: obs for obs in decision.detectors}
+    assert by_name["tampering"].status == DETECTOR_STATUS_SKIPPED
+    assert by_name["tampering"].reason == "suppressed_by_gate"
+    # The skipped detector never ran and never entered the tracker.
+    assert engine._detectors["tampering"].calls == 0
+    assert engine._tracker._windows.get("tampering") is None
+    assert "tampering" not in engine._tracker.confirmation_status()
+    assert engine.drain_events() == []
 
 
 # --- Emission gating (confirmation confidence floor) ------------------------

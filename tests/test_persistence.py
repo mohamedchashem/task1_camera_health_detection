@@ -19,6 +19,7 @@ from pipeline.decision_engine import (
     DETECTOR_STATUS_ERROR,
     DETECTOR_STATUS_OK,
     DETECTOR_STATUS_SKIPPED,
+    DETECTOR_STATUS_UNAVAILABLE,
     ConfirmedFault,
     DecisionFrame,
     DetectorObservation,
@@ -352,6 +353,56 @@ def test_frame_logger_error_always_logged_skipped_not(tmp_path: Path) -> None:
     assert records[1]["detectors"]["tilt"]["status"] == "error"
 
 
+def test_frame_logger_persists_degraded_baseline_distinct_from_gate_skip(
+    tmp_path: Path,
+) -> None:
+    # The two reasons a detector may not contribute to the tracker's observed
+    # set must remain distinguishable in the frame log: tampering's
+    # degraded-baseline non-measurement (status "unavailable", reason
+    # "degraded_baseline") vs a gate-skipped detector (status "skipped",
+    # reason "suppressed_by_gate").
+    observations = [
+        DetectorObservation("low_light", DETECTOR_STATUS_OK, False, 0.1),
+        DetectorObservation(
+            "tampering", DETECTOR_STATUS_UNAVAILABLE, False, 0.0,
+            reason="degraded_baseline",
+        ),
+        DetectorObservation(
+            "tilt", DETECTOR_STATUS_SKIPPED, False, 0.0,
+            reason="suppressed_by_gate",
+        ),
+    ]
+    frame = DecisionFrame(
+        camera_id="cam1",
+        frame_number=0,
+        video_time_s=0.0,
+        primary_fault=None,
+        confidence=0.0,
+        secondary_symptoms=(),
+        suppressed_faults=(),
+        temporal_confirmation_status={},
+        detectors=tuple(observations),
+    )
+    path = tmp_path / "frame_log.jsonl"
+    logger = FrameLogger(path, interval_frames=1, flush_interval_frames=100, retention_days=7)
+    logger.open()
+    logger.write_frame(frame)
+    logger.close()
+
+    record = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    tampering = record["detectors"]["tampering"]
+    tilt = record["detectors"]["tilt"]
+    assert tampering["status"] == DETECTOR_STATUS_UNAVAILABLE
+    assert tampering["reason"] == "degraded_baseline"
+    assert tampering["is_candidate"] is False
+    assert tampering["confidence"] == 0.0
+    assert tilt["status"] == DETECTOR_STATUS_SKIPPED
+    assert tilt["reason"] == "suppressed_by_gate"
+    # The two non-measurement reasons never conflate.
+    assert tampering["status"] != tilt["status"]
+    assert tampering["reason"] != tilt["reason"]
+
+
 def test_frame_logger_periodic_flush_reaches_disk(tmp_path: Path) -> None:
     path = tmp_path / "frame_log.jsonl"
     logger = FrameLogger(path, interval_frames=1, flush_interval_frames=2, retention_days=7)
@@ -541,6 +592,34 @@ def test_banner_gate_skip_transparency() -> None:
         "unmeasurable: tampering, tilt",
         "t=2.00s",
     ]
+
+
+def test_banner_unmeasurable_line_identical_for_gate_skip_and_unavailable() -> None:
+    # The banner receives only fault names -- never the technical status or
+    # reason behind them -- so it structurally cannot distinguish a
+    # gate-skip-caused ("skipped"/"suppressed_by_gate") unmeasurable detector
+    # from a ran-but-unmeasurable one (status "unavailable", reason
+    # "degraded_baseline" or the subtask-8 "degraded_ambient_explained" /
+    # "degraded_ambient_unexplained" variants). All three causes share the
+    # EXACT same line on purpose: to a viewer each means "can't tell you right
+    # now", and the explained-vs-unexplained sub-decision stays in the frame
+    # log, never on the banner.
+    def _banner() -> list[str]:
+        return build_annotation_lines(
+            None,
+            0.0,
+            confirmed_faults=(Fault("low_light", 0.90),),
+            unmeasurable_faults=("tampering",),
+            video_time_s=2.0,
+        )
+
+    gate_skip_cause = _banner()          # unmeasurable from a gate-skip
+    degraded_baseline_cause = _banner()  # unmeasurable from "unavailable"/"degraded_baseline"
+    degraded_ambient_cause = _banner()   # unmeasurable from "unavailable"/"degraded_ambient_explained"|"_unexplained"
+    assert gate_skip_cause == degraded_baseline_cause == degraded_ambient_cause
+    assert "unmeasurable: tampering" in gate_skip_cause
+    assert "FAULT: low_light (conf=0.90)" in gate_skip_cause
+    assert "t=2.00s" in gate_skip_cause
 
 
 def test_banner_causal_suppression() -> None:

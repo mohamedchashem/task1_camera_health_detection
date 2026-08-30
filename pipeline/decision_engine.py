@@ -52,6 +52,19 @@ unmeasurable tilt detector instead of risking a spurious false tilt.
 Skipped detectors are excluded from the confirmation tracker, so their
 windows age out instead of being polluted by unmeasurable frames.
 
+Non-measurements: a detector that runs but declares it cannot measure
+(result reason in ``_NON_MEASUREMENT_REASONS``) is packaged with status
+``unavailable`` and its reason preserved. Tampering contributes two such
+reasons: ``degraded_baseline`` (static, per-camera) and ``degraded_ambient``
+(dynamic, per-frame: the frame's ambient retention collapsed below the
+degeneracy floor, so its relative comparison could not run meaningfully).
+The latter is resolved against the same frame's blur/low_light -- when one
+of them is independently severe the collapse is "explained by contamination"
+(reason ``degraded_ambient_explained``), otherwise it is
+``degraded_ambient_unexplained``. Both are excluded from the confirmation
+tracker's observed set exactly like skipped observations: they are not
+genuine negative measurements and must not dilute ``window_positive_rate``.
+
 Emission gating: a candidate frame counts toward temporal confirmation
 only when its confidence reaches the fault's floor in
 ``DECISION_CONFIRM_MIN_CONFIDENCE``, so weak noise is never logged as a
@@ -62,7 +75,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -88,6 +101,7 @@ from config import (
     TAMPERING_BLUR_AREA_SLACK,
     TAMPERING_LOW_LIGHT_AREA_SLACK,
 )
+from detectors.tampering import DEGRADED_AMBIENT_REASON, DEGRADED_BASELINE_REASON
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +109,64 @@ logger = logging.getLogger(__name__)
 DETECTOR_STATUS_OK = "ok"
 DETECTOR_STATUS_ERROR = "error"
 DETECTOR_STATUS_SKIPPED = "skipped"
+# The detector ran but could not produce a meaningful measurement this frame
+# (e.g. tampering on a degraded baseline or with a collapsed ambient:
+# evaluate() executed and returned a real result declaring no measurement
+# possible). Distinct from SKIPPED -- "did not run" (disabled, sub-sampled,
+# backoff, gate) -- so the frame log records that the detector actually ran
+# yet its signal is not a valid observation. Excluded from the confirmation
+# tracker's observed set exactly like SKIPPED (only OK observations count),
+# so non-measurements never dilute window_positive_rate as false negatives.
+DETECTOR_STATUS_UNAVAILABLE = "unavailable"
+
+# Approach C (subtask 8): tampering's ``degraded_ambient`` outcome means the
+# frame's ambient retention collapsed below TAMPERING_AMBIENT_MIN_RETENTION --
+# no usable structure anywhere -- so the relative obstruction comparison is
+# meaningless: the frame is information-theoretically ambiguous for tampering.
+# The resolution in ``_resolve_degraded_ambient`` decides whether that
+# collapse is independently EXPLAINED by the same frame's global-degradation
+# detectors and surfaces it in the observation's reason:
+#   - ``degraded_ambient_explained``: blur and/or low_light reached the
+#     existing unmeasurable-severity bars (see _AMBIENT_CONTAMINATION_*), i.e.
+#     contamination genuinely wiped the structure out. The tampering
+#     contribution is "unverifiable, explained by contamination" -- never a
+#     clean negative, and not evidence of tampering.
+#   - ``degraded_ambient_unexplained``: no other known fault explains the
+#     collapse. Practical handling is identical (excluded from the observed
+#     set -- it must never read as "no tampering"), but the distinction is
+#     kept for diagnostics: an unexplained global structure collapse with no
+#     known cause is its own operational signal (possible full-lens
+#     obstruction, sensor/hardware failure, or an unmodelled scene condition).
+DEGRADED_AMBIENT_EXPLAINED_REASON = "degraded_ambient_explained"
+DEGRADED_AMBIENT_UNEXPLAINED_REASON = "degraded_ambient_unexplained"
+
+# Severity bars for the contamination resolution above. Not new tuned numbers:
+# both alias already-documented thresholds from the existing
+# "unmeasurable severity" conventions.
+#   - blur: its own gate floor (0.9). Physically, blur confidence 0.9 means
+#     sharpness_ratio <= 0.1 -- the frame retains at most 10% of baseline
+#     sharpness, the same 10% severity as TAMPERING_AMBIENT_MIN_RETENTION.
+#   - low_light: its near-black floor (0.8), the system's existing bar for
+#     "the whole frame is unmeasurably dark". In the current gate
+#     configuration low_light >= 0.8 gate-skips tampering entirely, so the
+#     low_light branch is defensive completeness; blur is the realistic
+#     explainer.
+_AMBIENT_CONTAMINATION_BLUR_CONFIDENCE = DECISION_GATE_CONFIDENCE_BY_GATE["blur"]
+_AMBIENT_CONTAMINATION_LOW_LIGHT_CONFIDENCE = LOW_LIGHT_BLUR_NEAR_BLACK_FLOOR
+
+# Detector result reasons that mean "ran but could not measure" (a
+# non-measurement). A result declaring one of these is packaged with status
+# DETECTOR_STATUS_UNAVAILABLE instead of OK, keeping it out of the tracker's
+# observed set without conflating it with a gate-skip or backoff skip. The
+# engine-produced resolved variants of DEGRADED_AMBIENT_REASON are included
+# so every "degraded_ambient*" reason stays a non-measurement wherever it
+# appears.
+_NON_MEASUREMENT_REASONS = frozenset({
+    DEGRADED_BASELINE_REASON,
+    DEGRADED_AMBIENT_REASON,
+    DEGRADED_AMBIENT_EXPLAINED_REASON,
+    DEGRADED_AMBIENT_UNEXPLAINED_REASON,
+})
 
 # Temporal confirmation statuses (per fault, per frame)
 TEMPORAL_STATUS_PENDING = "pending"
@@ -230,12 +302,14 @@ class DetectorObservation:
     """Result of running one detector on one frame, after isolation."""
 
     detector: str
-    status: str                # DETECTOR_STATUS_OK | ERROR | SKIPPED
+    status: str                # DETECTOR_STATUS_OK | ERROR | SKIPPED | UNAVAILABLE
     is_candidate: bool
     confidence: float
     error_message: str | None = None
     reason: str | None = None   # optional diagnostic for non-error states
                                 # ("suppressed_by_gate", "degraded_baseline",
+                                # "degraded_ambient_explained",
+                                # "degraded_ambient_unexplained",
                                 # tilt TILT_STATUS_*, ...)
     metrics: dict[str, float] = field(default_factory=dict)
                                 # raw measurands the detector exposes on its
@@ -249,6 +323,63 @@ class DetectorObservation:
                                 # for debugging. The engine populates it on
                                 # every OK observation; the default keeps
                                 # direct constructions in tests working.
+
+
+def _ambient_collapse_explained_by(
+    observations: Iterable[DetectorObservation],
+) -> bool:
+    """True when this frame's blur or low_light independently measures severe
+    global degradation (at/above its contamination floor), i.e. the collapse
+    of tampering's ambient retention is genuinely explained by contamination.
+
+    Only OK observations with a real severity count: a skipped, errored, or
+    unavailable explainer explains nothing. Non-candidates report confidence
+    0.0 (zeroed at packaging), so an OK observation at/above the floor is by
+    construction a genuine candidate-level measurement.
+    """
+    by_name = {obs.detector: obs for obs in observations}
+    blur = by_name.get("blur")
+    low_light = by_name.get("low_light")
+    if (
+        blur is not None
+        and blur.status == DETECTOR_STATUS_OK
+        and blur.confidence >= _AMBIENT_CONTAMINATION_BLUR_CONFIDENCE
+    ):
+        return True
+    if (
+        low_light is not None
+        and low_light.status == DETECTOR_STATUS_OK
+        and low_light.confidence >= _AMBIENT_CONTAMINATION_LOW_LIGHT_CONFIDENCE
+    ):
+        return True
+    return False
+
+
+def _resolve_degraded_ambient(
+    observations: list[DetectorObservation],
+) -> list[DetectorObservation]:
+    """Resolve each ``degraded_ambient`` tampering observation against the
+    same frame's blur/low_light observations (Approach C, subtask 8).
+
+    Rewrites the reason to ``degraded_ambient_explained`` when the collapse is
+    independently explained by severe blur or low_light, and to
+    ``degraded_ambient_unexplained`` otherwise. The status (``unavailable``)
+    is preserved: both outcomes are non-measurements, never clean negatives.
+    All other observations pass through unchanged.
+    """
+    resolved = list(observations)
+    explained = _ambient_collapse_explained_by(resolved)
+    for i, obs in enumerate(resolved):
+        if obs.detector == "tampering" and obs.reason == DEGRADED_AMBIENT_REASON:
+            resolved[i] = replace(
+                obs,
+                reason=(
+                    DEGRADED_AMBIENT_EXPLAINED_REASON
+                    if explained
+                    else DEGRADED_AMBIENT_UNEXPLAINED_REASON
+                ),
+            )
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -800,7 +931,10 @@ class DecisionEngine:
                 detector. A detector not enabled for a frame yields a
                 ``status="skipped"`` observation that is NOT added to the
                 tracker's observed set, so an unobserved frame cannot dilute
-                the confirmation positive ratio.
+                the confirmation positive ratio. A detector that runs but
+                cannot measure (e.g. degraded-baseline tampering) yields a
+                ``status="unavailable"`` observation that is likewise NOT
+                added to the observed set.
         """
         if enabled_faults is None:
             enabled = set(self._detectors)
@@ -845,6 +979,14 @@ class DecisionEngine:
             ):
                 active_gates[name] = obs.confidence
 
+        # Degraded-ambient resolution (Approach C, subtask 8): a tampering
+        # observation whose frame's ambient retention collapsed (reason
+        # ``degraded_ambient``) is a non-measurement. Resolve whether the
+        # collapse is explained by the same frame's independently severe blur
+        # or low_light and surface that in the reason, so it never silently
+        # reads as "no tampering".
+        observations = _resolve_degraded_ambient(observations)
+
         candidates = {
             obs.detector: obs
             for obs in observations
@@ -877,7 +1019,10 @@ class DecisionEngine:
             fault.fault_type: fault.confidence for fault in faults
         }
         # Only OK observations count as observed: skipped detectors (disabled,
-        # sub-sampled, or in backoff) must not dilute the confirmation ratio.
+        # sub-sampled, or in backoff) and unavailable detectors (ran but could
+        # not measure, e.g. tampering on a degraded baseline or with a
+        # collapsed ambient) must not dilute the confirmation ratio with
+        # non-measurements.
         observed = [obs.detector for obs in observations if obs.status == DETECTOR_STATUS_OK]
         self._pending_events.extend(
             self._tracker.update(tracker_candidates, observed, frame_number, video_time_s)
@@ -982,12 +1127,22 @@ class DecisionEngine:
             return DetectorObservation(name, DETECTOR_STATUS_ERROR, False, 0.0, str(exc))
 
         self._consecutive_errors[name] = 0
+        reason = getattr(result, "reason", None)
+        # A result declaring it could not measure (e.g. degraded-baseline
+        # tampering) is a non-measurement, not a genuine negative: package it
+        # with status UNAVAILABLE so it stays out of the tracker's observed
+        # set (which only admits OK observations), exactly like skipped frames.
+        status = (
+            DETECTOR_STATUS_UNAVAILABLE
+            if reason in _NON_MEASUREMENT_REASONS
+            else DETECTOR_STATUS_OK
+        )
         return DetectorObservation(
             name,
-            DETECTOR_STATUS_OK,
+            status,
             is_candidate,
             confidence,
-            reason=getattr(result, "reason", None),
+            reason=reason,
             metrics=_extract_detector_metrics(name, result),
             raw_confidence=raw_confidence,
         )
